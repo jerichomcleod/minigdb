@@ -1,0 +1,7 @@
+/target
+/minigdb.wal
+/minigdb.snap
+/minigdb.snap.tmp
+/.minigdb_history
+.DS_Store
+.claude/

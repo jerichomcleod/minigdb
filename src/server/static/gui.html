@@ -1,0 +1,1100 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>minigdb</title>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3.29.2/dist/cytoscape.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-fcose@2.2.0/cytoscape-fcose.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+/* header */
+#hdr{background:#161b22;padding:7px 14px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #30363d;flex-shrink:0}
+#hdr h1{color:#58a6ff;font-size:1em;letter-spacing:1px;white-space:nowrap}
+#status{color:#8b949e;font-size:11px;margin-left:auto;white-space:nowrap}
+/* controls */
+select,input{background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:3px 7px;border-radius:4px;font-family:inherit;font-size:12px}
+button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:3px 10px;cursor:pointer;border-radius:4px;font-size:12px;white-space:nowrap}
+button:hover{background:#58a6ff;color:#0d1117;border-color:#58a6ff}
+button.active{background:#1f6feb;border-color:#388bfd;color:#fff}
+button.danger:hover{background:#f85149;border-color:#f85149}
+/* transaction buttons */
+button.txn-begin{border-color:#3fb950;color:#3fb950}
+button.txn-begin:hover{background:#3fb950;color:#0d1117}
+button.txn-commit{background:#0d2010;border-color:#3fb950;color:#3fb950}
+button.txn-commit:hover{background:#3fb950;color:#0d1117}
+button.txn-rollback{background:#200d0d;border-color:#f85149;color:#f85149}
+button.txn-rollback:hover{background:#f85149;color:#0d1117}
+/* main split */
+#main{display:flex;flex:1;overflow:hidden}
+#left{width:44%;display:flex;flex-direction:column;min-width:220px;max-width:78%}
+/* drag handle */
+#drag-handle{width:5px;background:#30363d;cursor:col-resize;flex-shrink:0;transition:background .15s;z-index:10}
+#drag-handle:hover,#drag-handle.dragging{background:#58a6ff}
+/* editor */
+#editor-wrap{padding:8px;border-bottom:1px solid #30363d;position:relative}
+#gql{width:100%;height:108px;background:#0d1117;color:#79c0ff;border:1px solid #30363d;padding:8px;font-family:'Courier New',monospace;font-size:13px;resize:none;border-radius:4px;line-height:1.4}
+#gql:focus{outline:none;border-color:#58a6ff}
+#hist-nav{position:absolute;bottom:12px;right:12px;font-size:10px;color:#484f58;pointer-events:none}
+#btns{display:flex;gap:6px;padding:6px 8px;align-items:center;flex-shrink:0;border-bottom:1px solid #21262d;flex-wrap:wrap}
+/* transaction bar */
+#txnbar{display:flex;gap:6px;padding:4px 8px;align-items:center;flex-shrink:0;border-bottom:1px solid #30363d}
+#txn-status{font-size:11px;color:#484f58;margin-right:auto}
+#txn-status.active{color:#3fb950}
+#results{flex:1;overflow:auto}
+/* table */
+table{border-collapse:collapse;width:100%;font-size:12px}
+th{background:#161b22;color:#58a6ff;padding:5px 10px;text-align:left;position:sticky;top:0;border-bottom:1px solid #30363d;font-weight:normal;cursor:pointer;user-select:none;white-space:nowrap}
+th:hover{color:#79c0ff}
+th .sa{color:#484f58;margin-left:3px;font-size:10px}
+th.sort-asc .sa::after{content:'↑';color:#58a6ff}
+th.sort-desc .sa::after{content:'↓';color:#58a6ff}
+th:not(.sort-asc):not(.sort-desc) .sa::after{content:'⇅'}
+td{padding:4px 10px;border-bottom:1px solid #21262d;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis}
+tr:hover td{background:#161b22}
+.null{color:#484f58;font-style:italic}
+.err{color:#f85149;padding:8px 10px;font-size:12px}
+.info{color:#8b949e;padding:8px 10px;font-size:12px}
+.id-link{color:#58a6ff;text-decoration:underline;cursor:pointer;font-size:11px}
+.id-link:hover{color:#79c0ff}
+/* right / graph */
+#right{flex:1;display:flex;flex-direction:column;overflow:hidden}
+#gtbar{background:#161b22;border-bottom:1px solid #30363d;padding:5px 8px;display:flex;align-items:center;gap:6px;flex-shrink:0;flex-wrap:wrap}
+#gtbar label{color:#8b949e;font-size:11px}
+#filter-input{width:100px;font-size:11px;padding:2px 6px}
+#graph-wrap{flex:1;position:relative;overflow:hidden}
+#cy{position:absolute;inset:0;background:#0d1117}
+/* graph overlay text */
+#graph-stats{position:absolute;top:6px;left:8px;font-size:11px;color:#484f58;pointer-events:none;z-index:5}
+/* color legend */
+#legend{position:absolute;bottom:6px;left:8px;display:flex;flex-wrap:wrap;gap:4px;pointer-events:none;z-index:5;max-width:50%}
+.li{display:flex;align-items:center;gap:4px;background:rgba(13,17,23,.82);padding:2px 7px;border-radius:3px;font-size:11px}
+.ld{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+/* pin hint */
+#pinhint{position:absolute;top:6px;right:8px;font-size:11px;color:#484f58;pointer-events:none;z-index:5}
+/* node/edge info panel */
+#node-info{padding:8px 10px;font-size:12px;border-top:1px solid #30363d;background:#161b22;display:none;max-height:95px;overflow-y:auto;line-height:1.7;flex-shrink:0}
+/* hover tooltip */
+#tooltip{position:fixed;background:#161b22;border:1px solid #30363d;border-radius:4px;padding:6px 10px;font-size:11px;color:#c9d1d9;pointer-events:none;z-index:50;display:none;max-width:260px;line-height:1.6;white-space:pre-wrap}
+/* fullscreen */
+#graph-wrap:fullscreen{background:#0d1117}
+#graph-wrap:-webkit-full-screen{background:#0d1117}
+#graph-wrap:fullscreen #cy,#graph-wrap:-webkit-full-screen #cy{position:absolute;inset:0}
+/* login overlay */
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,.8);display:flex;align-items:center;justify-content:center;z-index:100}
+#login{background:#161b22;border:1px solid #30363d;padding:28px;min-width:280px;border-radius:8px}
+#login h2{color:#58a6ff;margin-bottom:18px;font-size:1em;letter-spacing:1px}
+#login input{display:block;width:100%;margin-bottom:10px;padding:7px 10px;font-size:13px}
+#lerr{color:#f85149;font-size:12px;margin-top:6px;min-height:18px}
+/* custom modal */
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:200}
+#modal.show{display:flex}
+#modal-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:22px 24px;min-width:260px;max-width:400px}
+#modal-msg{color:#c9d1d9;font-size:13px;margin-bottom:16px;line-height:1.5;white-space:pre-line}
+#modal-btns{display:flex;gap:8px;justify-content:flex-end}
+/* saved views modal */
+#views-modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:200}
+#views-modal.show{display:flex}
+#views-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:22px 24px;min-width:340px;max-width:500px;width:90%;display:flex;flex-direction:column;max-height:70vh}
+#views-box h3{color:#58a6ff;font-size:13px;margin-bottom:14px;letter-spacing:.5px}
+#views-list{overflow-y:auto;flex:1;margin-bottom:14px;min-height:40px}
+.view-row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #21262d}
+.view-row:last-child{border-bottom:none}
+.view-name{flex:1;color:#c9d1d9;font-size:12px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.view-name:hover{color:#58a6ff}
+.view-date{font-size:11px;color:#484f58;white-space:nowrap;flex-shrink:0}
+.view-del{background:none;border:none;color:#484f58;cursor:pointer;padding:0 4px;font-size:14px;line-height:1;flex-shrink:0}
+.view-del:hover{color:#f85149;background:none}
+#views-footer{display:flex;justify-content:flex-end}
+</style>
+</head><body>
+
+<!-- Hover tooltip -->
+<div id="tooltip"></div>
+
+<!-- Custom confirm modal -->
+<div id="modal">
+  <div id="modal-box">
+    <div id="modal-msg"></div>
+    <div id="modal-btns">
+      <button id="modal-no">Cancel</button>
+      <button id="modal-yes" class="danger">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- Saved views modal -->
+<div id="views-modal">
+  <div id="views-box">
+    <h3>SAVED VIEWS</h3>
+    <div id="views-list"></div>
+    <div id="views-footer">
+      <button onclick="closeViewsModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Login overlay -->
+<div id="overlay" style="display:none">
+  <div id="login">
+    <h2>⬡ minigdb</h2>
+    <input id="lu" placeholder="username" autocomplete="username">
+    <input id="lp" type="password" placeholder="password" autocomplete="current-password">
+    <button onclick="doLogin()">Sign in</button>
+    <div id="lerr"></div>
+  </div>
+</div>
+
+<div id="hdr">
+  <h1>⬡ minigdb</h1>
+  <select id="gsel" onchange="switchGraph(this.value)" title="Active graph"></select>
+  <button onclick="newGraph()">+ Graph</button>
+  <button onclick="dropGraph()" class="danger">✕ Drop</button>
+  <span id="status"></span>
+</div>
+
+<div id="main">
+  <div id="left">
+    <div id="editor-wrap">
+      <textarea id="gql" spellcheck="false"
+        placeholder="GQL  ·  Ctrl+Enter: run  ·  Ctrl+Shift+Enter: visualize&#10;Shift+↑/↓: query history&#10;&#10;MATCH (n:Person) RETURN n.name, n.age&#10;INSERT (:Person {name: &quot;Alice&quot;, age: 30})&#10;MATCH (a)-[r]->(b) RETURN a, r, b"></textarea>
+      <div id="hist-nav"></div>
+    </div>
+    <div id="btns">
+      <button onclick="runQuery()" title="Ctrl+Enter">▶ Run</button>
+      <button onclick="vizQuery()" title="Ctrl+Shift+Enter">⬡ Visualize</button>
+      <button id="modeBtn" onclick="toggleMode()" title="Replace: clears view&#10;Add: merges into view">↔ Replace</button>
+      <button onclick="exportCSV()" title="Export results as CSV">↓ CSV</button>
+    </div>
+    <div id="txnbar">
+      <span id="txn-status">No transaction</span>
+      <button id="btn-begin"    class="txn-begin"   onclick="txnCmd('BEGIN')">BEGIN</button>
+      <button id="btn-commit"   class="txn-commit"  onclick="txnCmd('COMMIT')"   style="display:none">COMMIT</button>
+      <button id="btn-rollback" class="txn-rollback" onclick="txnCmd('ROLLBACK')" style="display:none">ROLLBACK</button>
+    </div>
+    <div id="results"><div class="info">Run a GQL query to see results.</div></div>
+  </div>
+
+  <div id="drag-handle"></div>
+
+  <div id="right">
+    <div id="gtbar">
+      <label>Layout:</label>
+      <select id="layoutSel" onchange="runLayout(true)">
+        <option value="fcose">Force-directed</option>
+        <option value="circle">Circular</option>
+        <option value="concentric">Concentric</option>
+        <option value="dagre">Hierarchical</option>
+        <option value="multipartite">Multipartite</option>
+        <option value="grid">Grid</option>
+      </select>
+      <label>Color:</label>
+      <select id="colorBy" onchange="updateColors()"><option value="__label__">Type</option></select>
+      <button onclick="runLayout(true)" title="Re-run layout">⟳</button>
+      <button onclick="resetView()" title="Fit all nodes in view">⛶</button>
+      <button onclick="unpinAll()" title="Release all pinned nodes">⊘ Unpin</button>
+      <button id="lblBtn" onclick="toggleLabels()" title="Show/hide labels">⌗ Labels</button>
+      <button onclick="toggleFullscreen()" title="Fullscreen graph">⤢</button>
+      <input id="filter-input" placeholder="Filter nodes…" oninput="filterNodes(this.value)" title="Filter nodes by label or property">
+      <button id="saveViewBtn" onclick="saveView()" title="Save current graph view as a named view" disabled>💾 Save View</button>
+      <button onclick="openViewsModal()" title="Load or manage saved views">📂 Views</button>
+    </div>
+
+    <div id="graph-wrap">
+      <div id="cy"></div>
+      <div id="graph-stats"></div>
+      <div id="legend"></div>
+      <div id="pinhint">Drag to pin · Right-click to unpin · Del to remove</div>
+    </div>
+    <div id="node-info">
+      <button id="expand-btn" onclick="expandHop()" title="Load one hop of neighbours for selected nodes" style="display:none;float:right;margin-left:8px;padding:2px 8px;background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;cursor:pointer;font-size:11px">⊕ Expand</button>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ── State ──────────────────────────────────────────────────────────────────────
+let token         = sessionStorage.getItem('mgdb_token') || '';
+let currentGraph  = 'default';
+let cy            = null;
+let addMode       = false;
+let layoutRunning = false;
+let layoutInst    = null;
+let labelsVisible = true;
+let currentRows   = [];
+let sortCol       = null;
+let sortDir       = 1;   // 1 = asc, -1 = desc
+let inTxn         = false;
+
+// ── Query history ──────────────────────────────────────────────────────────────
+const MAX_HIST = 30;
+let histList = JSON.parse(localStorage.getItem('mgdb_hist') || '[]');
+let histIdx  = -1;
+
+function pushHistory(q) {
+  if (!q.trim() || histList[0] === q) { histIdx = -1; return; }
+  histList.unshift(q);
+  if (histList.length > MAX_HIST) histList.pop();
+  localStorage.setItem('mgdb_hist', JSON.stringify(histList));
+  histIdx = -1;
+}
+
+function updateHistNav() {
+  document.getElementById('hist-nav').textContent =
+    histIdx >= 0 ? `hist ${histIdx + 1}/${histList.length}` : '';
+}
+
+document.getElementById('gql').addEventListener('keydown', e => {
+  if (!e.shiftKey) return;
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (!histList.length) return;
+    histIdx = Math.min(histIdx + 1, histList.length - 1);
+    document.getElementById('gql').value = histList[histIdx];
+    updateHistNav();
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (histIdx <= 0) { histIdx = -1; document.getElementById('gql').value = ''; }
+    else { histIdx--; document.getElementById('gql').value = histList[histIdx]; }
+    updateHistNav();
+  }
+});
+
+// ── Custom confirm modal ───────────────────────────────────────────────────────
+function customConfirm(msg) {
+  return new Promise(resolve => {
+    document.getElementById('modal-msg').textContent = msg;
+    document.getElementById('modal').classList.add('show');
+    const close = v => {
+      document.getElementById('modal').classList.remove('show');
+      resolve(v);
+    };
+    document.getElementById('modal-yes').addEventListener('click', () => close(true),  { once: true });
+    document.getElementById('modal-no').addEventListener('click',  () => close(false), { once: true });
+  });
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    if (document.getElementById('modal').classList.contains('show'))
+      document.getElementById('modal').classList.remove('show');
+    if (document.getElementById('views-modal').classList.contains('show'))
+      closeViewsModal();
+  }
+});
+
+// ── Color palette ──────────────────────────────────────────────────────────────
+const PALETTE = [
+  '#4e9af1','#ff7b54','#7bed9f','#eccc68','#a29bfe',
+  '#fd79a8','#55efc4','#fdcb6e','#e17055','#74b9ff',
+  '#badc58','#f9ca24','#6ab04c','#eb4d4b','#686de0'
+];
+const colorMap = {};
+let palIdx = 0;
+function getColor(k) {
+  if (!colorMap[k]) colorMap[k] = PALETTE[palIdx++ % PALETTE.length];
+  return colorMap[k];
+}
+
+// Return '#000000' or '#ffffff' — whichever has more contrast against `hex`.
+function contrastColor(hex) {
+  const c = hex.replace('#', '');
+  const r = parseInt(c.slice(0, 2), 16);
+  const g = parseInt(c.slice(2, 4), 16);
+  const b = parseInt(c.slice(4, 6), 16);
+  // WCAG relative luminance (linearise sRGB, then weight channels)
+  const lin = v => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+  const L = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+  return L > 0.179 ? '#000000' : '#ffffff';
+}
+
+// ── API ────────────────────────────────────────────────────────────────────────
+async function api(path, opts = {}) {
+  const hdrs = { 'Content-Type': 'application/json' };
+  if (token) hdrs['Authorization'] = 'Bearer ' + token;
+  let res;
+  try { res = await fetch(path, { ...opts, headers: { ...hdrs, ...(opts.headers || {}) } }); }
+  catch (e) { return { error: e.message }; }
+  if (res.status === 401) { showLogin(); return null; }
+  try { return await res.json(); } catch { return { error: 'bad JSON from server' }; }
+}
+
+// ── Auth ───────────────────────────────────────────────────────────────────────
+function showLogin() {
+  document.getElementById('overlay').style.display = 'flex';
+  setTimeout(() => document.getElementById('lu').focus(), 60);
+}
+async function doLogin() {
+  const u = document.getElementById('lu').value.trim();
+  const p = document.getElementById('lp').value;
+  document.getElementById('lerr').textContent = '';
+  const res = await fetch('/api/auth', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user: u, password: p })
+  });
+  const d = await res.json();
+  if (!res.ok) { document.getElementById('lerr').textContent = d.error || 'Login failed'; return; }
+  token = d.token;
+  sessionStorage.setItem('mgdb_token', token);
+  document.getElementById('overlay').style.display = 'none';
+  await loadGraphs(); initCy();
+}
+document.getElementById('lp').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+// ── Startup ────────────────────────────────────────────────────────────────────
+async function init() {
+  const info = await api('/api/info');
+  if (!info) return;
+  if (info.auth_required && !token) { showLogin(); return; }
+  await loadGraphs(); initCy();
+}
+
+// ── Graph management ───────────────────────────────────────────────────────────
+async function loadGraphs() {
+  const d = await api('/api/graphs');
+  if (!d || d.error) return;
+  const sel = document.getElementById('gsel');
+  const prev = currentGraph;
+  sel.innerHTML = d.graphs.map(g =>
+    `<option value="${esc(g)}"${g === prev ? ' selected' : ''}>${esc(g)}</option>`
+  ).join('');
+  currentGraph = sel.value || 'default';
+}
+function switchGraph(name) { currentGraph = name; setStatus('Graph: ' + name); }
+
+async function newGraph() {
+  const name = prompt('New graph name:');
+  if (!name) return;
+  const r = await api('/api/graphs', { method: 'POST', body: JSON.stringify({ name }) });
+  if (r && r.error) { alert(r.error); return; }
+  await loadGraphs();
+  document.getElementById('gsel').value = name;
+  switchGraph(name);
+}
+
+async function dropGraph() {
+  const ok = await customConfirm(`Delete graph "${currentGraph}"?\nThis cannot be undone.`);
+  if (!ok) return;
+  const r = await api(`/api/graphs/${encodeURIComponent(currentGraph)}`, { method: 'DELETE' });
+  if (r && r.error) { alert(r.error); return; }
+  await loadGraphs();
+}
+
+// ── Transaction ────────────────────────────────────────────────────────────────
+async function txnCmd(cmd) {
+  setStatus(cmd + '…');
+  const d = await api('/api/query', {
+    method: 'POST',
+    body: JSON.stringify({ graph: currentGraph, query: cmd })
+  });
+  if (!d) return;
+  if (d.error) { setStatus('Error'); showError(d.error); return; }
+  if (cmd === 'BEGIN')                       inTxn = true;
+  if (cmd === 'COMMIT' || cmd === 'ROLLBACK') inTxn = false;
+  updateTxnUI();
+  setStatus(cmd + ' OK');
+}
+
+function updateTxnUI() {
+  document.getElementById('txn-status').textContent = inTxn ? 'Transaction active' : 'No transaction';
+  document.getElementById('txn-status').className   = inTxn ? 'active' : '';
+  document.getElementById('btn-begin').style.display    = inTxn ? 'none' : '';
+  document.getElementById('btn-commit').style.display   = inTxn ? '' : 'none';
+  document.getElementById('btn-rollback').style.display = inTxn ? '' : 'none';
+}
+
+// ── Query ──────────────────────────────────────────────────────────────────────
+function setStatus(m) { document.getElementById('status').textContent = m; }
+
+async function runQuery() {
+  const q = document.getElementById('gql').value.trim();
+  if (!q) return;
+  pushHistory(q);
+  setStatus('Running…');
+  const t = Date.now();
+  // Use /api/viz so that node/edge variables in results auto-populate the graph panel.
+  const d = await api('/api/viz', { method: 'POST', body: JSON.stringify({ graph: currentGraph, query: q }) });
+  if (!d) return;
+  if (d.error) { setStatus('Error'); showError(d.error); return; }
+  // Sync transaction state if BEGIN/COMMIT/ROLLBACK was typed directly.
+  const ql = q.toUpperCase().trim();
+  if (ql === 'BEGIN')                            { inTxn = true;  updateTxnUI(); }
+  else if (ql === 'COMMIT' || ql === 'ROLLBACK') { inTxn = false; updateTxnUI(); }
+  setStatus(`${(d.rows || []).length} row(s) · ${Date.now() - t}ms`);
+  currentRows = d.rows || [];
+  sortCol = null; sortDir = 1;
+  renderTable(currentRows);
+  // Auto-render graph if any nodes or edges were resolved from the results.
+  if ((d.nodes || []).length > 0 || (d.edges || []).length > 0) {
+    renderGraph(d);
+  }
+}
+
+async function vizQuery() {
+  const q = document.getElementById('gql').value.trim();
+  if (!q) return;
+  pushHistory(q);
+  setStatus('Visualizing…');
+  const t = Date.now();
+  const d = await api('/api/viz', { method: 'POST', body: JSON.stringify({ graph: currentGraph, query: q }) });
+  if (!d) return;
+  if (d.error) { setStatus('Error'); showError(d.error); return; }
+  const nn = (d.nodes || []).length, ne = (d.edges || []).length;
+  setStatus(`${nn} node${nn !== 1 ? 's' : ''} · ${ne} edge${ne !== 1 ? 's' : ''} · ${Date.now() - t}ms`);
+  currentRows = d.rows || [];
+  sortCol = null; sortDir = 1;
+  renderTable(currentRows);
+  renderGraph(d);
+}
+
+// ── Expand Hop ────────────────────────────────────────────────────────────────
+// Load one hop of neighbours for the currently selected nodes in the graph view.
+// Builds a MATCH query that matches any of the selected node IDs and traverses
+// one undirected hop, then merges the new nodes/edges into the current view.
+async function expandHop() {
+  if (!cy) return;
+  const selected = cy.nodes(':selected');
+  const seeds = selected.length > 0 ? selected : cy.nodes();
+  if (!seeds.length) { setStatus('No nodes to expand'); return; }
+
+  // Build OR-chain: n.id = "id1" OR n.id = "id2" ...
+  // We use MATCH (n) WHERE n = "ulid" syntax since IDs are ULIDs stored as node IDs.
+  const ids = seeds.map(n => n.id());
+  // Build a WHERE OR-chain using id(n) = 'ulid' — same pattern as nodeIdsToQuery().
+  const conds = ids.map(id => `id(n) = '${id}'`).join(' OR ');
+  const gql = `MATCH (n)-[r]-(m) WHERE ${conds} RETURN n, r, m`;
+
+  setStatus('Expanding…');
+  const t = Date.now();
+  const prevAdd = addMode;
+  addMode = true; // always merge into existing view
+  try {
+    const d = await api('/api/viz', { method: 'POST', body: JSON.stringify({ graph: currentGraph, query: gql }) });
+    if (!d) return;
+    if (d.error) { setStatus('Expand error'); showError(d.error); return; }
+    const nn = (d.nodes || []).length, ne = (d.edges || []).length;
+    setStatus(`Expanded: +${nn} node${nn !== 1 ? 's' : ''}, +${ne} edge${ne !== 1 ? 's' : ''} · ${Date.now() - t}ms`);
+    renderGraph(d);
+  } finally {
+    addMode = prevAdd;
+  }
+}
+
+// ── Replace / Add toggle ───────────────────────────────────────────────────────
+function toggleMode() {
+  addMode = !addMode;
+  const btn = document.getElementById('modeBtn');
+  btn.textContent = addMode ? '➕ Add' : '↔ Replace';
+  btn.classList.toggle('active', addMode);
+}
+
+// ── Table ──────────────────────────────────────────────────────────────────────
+const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function fmtCell(v) {
+  if (v === null || v === undefined) return '<span class="null">null</span>';
+  const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+  const display = s.length > 72 ? s.slice(0, 69) + '…' : s;
+  // Clickable ULID if it resolves to a graph element in the current view
+  if (ULID_RE.test(s) && cy && cy.getElementById(s).length) {
+    return `<span class="id-link" onclick="highlightElement('${esc(s)}')" title="Highlight in graph: ${esc(s)}">${esc(display)}</span>`;
+  }
+  return esc(display);
+}
+
+function highlightElement(id) {
+  if (!cy) return;
+  const el = cy.getElementById(id);
+  if (!el.length) return;
+  cy.elements().unselect();
+  el.select();
+  cy.animate({ center: { eles: el }, zoom: Math.max(cy.zoom(), 1.5) }, { duration: 300 });
+}
+
+function renderTable(rows) {
+  const div = document.getElementById('results');
+  if (!rows.length) { div.innerHTML = '<div class="info">(no results)</div>'; return; }
+  const cols = Object.keys(rows[0]);
+  // apply sort
+  let sorted = [...rows];
+  if (sortCol !== null && cols.includes(sortCol)) {
+    sorted.sort((a, b) => {
+      const av = a[sortCol], bv = b[sortCol];
+      if (av === null || av === undefined) return 1;
+      if (bv === null || bv === undefined) return -1;
+      return av < bv ? -sortDir : av > bv ? sortDir : 0;
+    });
+  }
+  const hdr = cols.map(c => {
+    const cls = c === sortCol ? (sortDir === 1 ? 'sort-asc' : 'sort-desc') : '';
+    return `<th class="${cls}" onclick="sortTable('${esc(c)}')">${esc(c)}<span class="sa"></span></th>`;
+  }).join('');
+  div.innerHTML =
+    '<table><thead><tr>' + hdr + '</tr></thead><tbody>' +
+    sorted.map(r =>
+      '<tr>' + cols.map(c => {
+        const raw = typeof r[c] === 'object' ? JSON.stringify(r[c] ?? '') : String(r[c] ?? '');
+        return `<td title="${esc(raw)}">${fmtCell(r[c])}</td>`;
+      }).join('') + '</tr>'
+    ).join('') +
+    '</tbody></table>';
+}
+
+function sortTable(col) {
+  if (sortCol === col) sortDir = -sortDir;
+  else { sortCol = col; sortDir = 1; }
+  renderTable(currentRows);
+}
+
+function showError(msg) {
+  document.getElementById('results').innerHTML = `<div class="err">Error: ${esc(msg)}</div>`;
+}
+
+// ── CSV export ─────────────────────────────────────────────────────────────────
+function exportCSV() {
+  if (!currentRows.length) return;
+  const cols = Object.keys(currentRows[0]);
+  const lines = [cols.join(',')];
+  for (const r of currentRows) {
+    lines.push(cols.map(c => {
+      const v = r[c];
+      if (v === null || v === undefined) return '';
+      const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+      return (s.includes(',') || s.includes('"') || s.includes('\n'))
+        ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }).join(','));
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv' }));
+  a.download = 'results.csv';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// ── Cytoscape init ─────────────────────────────────────────────────────────────
+function initCy() {
+  cy = cytoscape({
+    container: document.getElementById('cy'),
+    style: [
+      {
+        selector: 'node', style: {
+          'background-color': '#21262d', 'border-color': '#58a6ff', 'border-width': 2,
+          'color': '#c9d1d9', 'label': 'data(dispLabel)', 'font-size': 7,
+          'text-valign': 'center', 'text-halign': 'center',
+          'width': 46, 'height': 46, 'text-wrap': 'wrap', 'text-max-width': 84,
+          'text-background-color': '#21262d', 'text-background-opacity': 0.88,
+          'text-background-padding': '3px', 'text-background-shape': 'roundrectangle'
+        }
+      },
+      { selector: 'node:selected', style: { 'border-color': '#79c0ff', 'border-width': 3, 'border-style': 'solid' } },
+      { selector: 'node.pinned',   style: { 'border-style': 'dashed', 'border-color': '#f0883e', 'border-width': 3 } },
+      { selector: 'node.faded',    style: { 'opacity': 0.15 } },
+      { selector: 'node.no-label', style: { 'label': '', 'text-background-opacity': 0 } },
+      { selector: 'edge.no-label', style: { 'label': '' } },
+      {
+        selector: 'edge', style: {
+          'line-color': '#30363d', 'target-arrow-color': '#30363d',
+          'target-arrow-shape': 'triangle', 'curve-style': 'bezier',
+          'label': 'data(label)', 'font-size': 7, 'color': '#8b949e', 'width': 1.5,
+          'text-background-color': '#0d1117', 'text-background-opacity': 1, 'text-background-padding': '2px'
+        }
+      },
+      { selector: 'edge:selected', style: { 'line-color': '#58a6ff', 'target-arrow-color': '#58a6ff', 'width': 2.5 } },
+      { selector: 'edge.faded',    style: { 'opacity': 0.08 } }
+    ],
+    layout: { name: 'grid' }
+  });
+
+  const tooltip = document.getElementById('tooltip');
+
+  // ── Tap node → show properties in info panel
+  cy.on('tap', 'node', e => {
+    const d = e.target.data();
+    const info = document.getElementById('node-info');
+    info.style.display = 'block';
+    document.getElementById('expand-btn').style.display = 'inline-block';
+    const props = Object.entries(d)
+      .filter(([k]) => !['id', 'dispLabel', 'labels'].includes(k))
+      .map(([k, v]) => `<b style="color:#58a6ff">${esc(k)}</b>: ${esc(String(v))}`)
+      .join(' &nbsp;·&nbsp; ');
+    const pinnedBadge = e.target.hasClass('pinned')
+      ? ' <span style="color:#f0883e;font-size:11px">[pinned]</span>' : '';
+    info.innerHTML =
+      `<button id="expand-btn" onclick="expandHop()" title="Load one hop of neighbours for selected nodes" style="float:right;margin-left:8px;padding:2px 8px;background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;cursor:pointer;font-size:11px">⊕ Expand</button>` +
+      `<span style="color:#7ee787">NODE</span> ` +
+      `<span style="color:#79c0ff">${esc(d.labels || '(no label)')}</span>${pinnedBadge} ` +
+      `<span class="id-link" onclick="highlightElement('${esc(d.id)}')" title="${esc(d.id)}">${esc(d.id.slice(0, 13))}…</span><br>` +
+      (props || '<span style="color:#484f58">no properties</span>');
+  });
+
+  // ── Tap edge → show edge info in panel
+  cy.on('tap', 'edge', e => {
+    const d = e.target.data();
+    const info = document.getElementById('node-info');
+    info.style.display = 'block';
+    const props = Object.entries(d)
+      .filter(([k]) => !['id', 'source', 'target', 'label'].includes(k))
+      .map(([k, v]) => `<b style="color:#58a6ff">${esc(k)}</b>: ${esc(String(v))}`)
+      .join(' &nbsp;·&nbsp; ');
+    info.innerHTML =
+      `<span style="color:#d2a8ff">EDGE</span> ` +
+      `<span style="color:#f0883e">${esc(d.label || '(no label)')}</span> ` +
+      `<span style="color:#484f58;font-size:11px" title="${esc(d.id)}">${esc(d.id.slice(0, 13))}…</span><br>` +
+      `<span style="color:#8b949e">` +
+      `${esc(d.source.slice(0, 10))}… → ${esc(d.target.slice(0, 10))}…</span>` +
+      (props ? '<br>' + props : '');
+  });
+
+  // ── Tap canvas → hide info panel
+  cy.on('tap', e => {
+    if (e.target === cy) document.getElementById('node-info').style.display = 'none';
+  });
+
+  // ── Drag → pin node
+  cy.on('dragfree', 'node', e => {
+    e.target.lock();
+    e.target.addClass('pinned');
+  });
+
+  // ── Right-click → unpin
+  cy.on('cxttap', 'node', e => {
+    e.target.unlock();
+    e.target.removeClass('pinned');
+  });
+
+  // ── Hover tooltip
+  cy.on('mouseover', 'node', e => {
+    const d = e.target.data();
+    const props = Object.entries(d)
+      .filter(([k]) => !['id', 'dispLabel', 'labels'].includes(k))
+      .slice(0, 5)
+      .map(([k, v]) => `${k}: ${String(v)}`)
+      .join('\n');
+    tooltip.textContent = (d.labels || 'node') + (props ? '\n' + props : '');
+    tooltip.style.display = 'block';
+  });
+
+  cy.on('mouseover', 'edge', e => {
+    const d = e.target.data();
+    tooltip.textContent = `→ ${d.label || 'edge'}`;
+    tooltip.style.display = 'block';
+  });
+
+  cy.on('mouseout', 'node,edge', () => { tooltip.style.display = 'none'; });
+
+  cy.on('mousemove', e => {
+    const oe = e.originalEvent;
+    if (!oe) return;
+    // Use actual rendered dimensions so the flip stays tight to the cursor.
+    const tw = tooltip.offsetWidth  + 12;
+    const th = tooltip.offsetHeight + 12;
+    let tx = oe.clientX + 16;
+    let ty = oe.clientY + 16;
+    if (tx + tw > window.innerWidth)  tx = oe.clientX - tw;
+    if (ty + th > window.innerHeight) ty = oe.clientY - th;
+    tooltip.style.left = Math.max(4, tx) + 'px';
+    tooltip.style.top  = Math.max(4, ty) + 'px';
+  });
+}
+
+// ── Graph data render ──────────────────────────────────────────────────────────
+function renderGraph(data) {
+  if (!cy) return;
+  if (!addMode) {
+    cy.elements().remove();
+    document.getElementById('node-info').style.display = 'none';
+  }
+  const toAdd = [];
+  for (const n of (data.nodes || [])) {
+    if (cy.getElementById(n.id).length) continue;
+    const labels = (n.labels || []).join(':');
+    const props = n.properties || {};
+    const PREF = ['name','title','label','caption','key','id_name','username','email'];
+    const bestKey = PREF.find(k => props[k] !== undefined)
+      || Object.keys(props).find(k => typeof props[k] === 'string')
+      || Object.keys(props)[0];
+    const bestVal = bestKey !== undefined ? String(props[bestKey]) : n.id.slice(0, 8);
+    const dispLabel = (labels ? labels + '\n' : '') + bestVal;
+    toAdd.push({ group: 'nodes', data: { id: n.id, labels, dispLabel, ...n.properties } });
+  }
+  for (const e of (data.edges || [])) {
+    if (cy.getElementById(e.id).length) continue;
+    toAdd.push({ group: 'edges', data: { id: e.id, source: e.source, target: e.target, label: e.label } });
+  }
+  if (!toAdd.length) return;
+  cy.add(toAdd);
+  refreshColorByOptions();
+  updateColors();
+  updateGraphStats();
+  if (!labelsVisible) applyLabelVisibility();
+  runLayout(true);
+  updateSaveViewBtn();
+}
+
+// ── Layout ─────────────────────────────────────────────────────────────────────
+function layoutOpts(name, fit, randomize = true) {
+  const base = { animate: true, animationDuration: 480, fit };
+  switch (name) {
+    case 'fcose':      return { ...base, name: 'fcose', nodeRepulsion: 14000, idealEdgeLength: 130, nodeSeparation: 120, randomize };
+    case 'cose':       return { ...base, name: 'cose',  nodeRepulsion: 12000, padding: 40 };
+    case 'circle':     return { ...base, name: 'circle', padding: 28 };
+    case 'concentric': return { ...base, name: 'concentric', padding: 28, minNodeSpacing: 60 };
+    case 'dagre':      return { ...base, name: 'dagre', rankDir: 'TB', spacingFactor: 1.5 };
+    case 'grid':       return { ...base, name: 'grid', padding: 28 };
+    default:           return { ...base, name: 'cose',  nodeRepulsion: 12000, padding: 40 };
+  }
+}
+
+function multipartitePositions() {
+  const groups = {};
+  cy.nodes().forEach(n => {
+    const type = (n.data('labels') || '?').split(':')[0] || '?';
+    if (!groups[type]) groups[type] = [];
+    groups[type].push(n.id());
+  });
+  const types = Object.keys(groups).sort();
+  const colGap = 200, rowGap = 90;
+  const positions = {};
+  types.forEach((type, col) => {
+    const ids = groups[type];
+    const colOffset = (col - (types.length - 1) / 2) * colGap;
+    ids.forEach((id, row) => {
+      const rowOffset = (row - (ids.length - 1) / 2) * rowGap;
+      positions[id] = { x: colOffset, y: rowOffset };
+    });
+  });
+  return positions;
+}
+
+function nodesArePositioned() {
+  let spread = 0;
+  cy.nodes().forEach(n => { const p = n.position(); spread += Math.abs(p.x) + Math.abs(p.y); });
+  return spread > cy.nodes().length * 5;
+}
+
+// For force-directed layouts (cose/fcose): run computation silently,
+// then tween from current positions to computed positions so the motion
+// is smooth — identical to how dagre/circle/etc. animate.
+function runForceLayout(name, fit) {
+  const randomize = !nodesArePositioned();
+
+  // Save current positions so we can restore them before tweening.
+  const savedPos = {};
+  cy.nodes().forEach(n => { savedPos[n.id()] = { ...n.position() }; });
+
+  const computeWith = (layoutName) => {
+    try {
+      // Compute positions instantly with no visual output.
+      const computeLayout = cy.layout({
+        ...layoutOpts(layoutName, false, randomize),
+        animate: false
+      });
+      computeLayout.on('layoutstop', () => {
+        // Capture the computed final positions.
+        const finalPos = {};
+        cy.nodes().forEach(n => { finalPos[n.id()] = { ...n.position() }; });
+
+        // Restore nodes to where they were before computation.
+        cy.nodes().forEach(n => { n.position(savedPos[n.id()]); });
+
+        // Smoothly tween from saved → final positions.
+        layoutInst = cy.layout({ name: 'preset', positions: finalPos, animate: true, animationDuration: 500, fit, padding: 40 });
+        layoutInst.on('layoutstop', () => { layoutRunning = false; layoutInst = null; });
+        layoutInst.run();
+      });
+      computeLayout.run();
+    } catch (_) {
+      if (layoutName !== 'cose') {
+        computeWith('cose');
+      } else {
+        cy.nodes().forEach(n => { n.position(savedPos[n.id()]); });
+        layoutRunning = false;
+      }
+    }
+  };
+  computeWith(name);
+}
+
+function runLayout(fit = false) {
+  if (!cy || !cy.nodes().length) return;
+  if (layoutRunning && layoutInst) { try { layoutInst.stop(); } catch (_) {} }
+  const name = document.getElementById('layoutSel').value;
+  layoutRunning = true;
+
+  if (name === 'fcose' || name === 'cose') {
+    runForceLayout(name, fit);
+    return;
+  }
+  if (name === 'multipartite') {
+    layoutInst = cy.layout({ name: 'preset', positions: multipartitePositions(), animate: true, animationDuration: 480, fit, padding: 40 });
+    layoutInst.on('layoutstop', () => { layoutRunning = false; layoutInst = null; });
+    layoutInst.run();
+    return;
+  }
+  // dagre / circle / concentric / grid — these compute positions first
+  // then Cytoscape tweens to them natively with animate:true.
+  try {
+    layoutInst = cy.layout(layoutOpts(name, fit));
+    layoutInst.on('layoutstop', () => { layoutRunning = false; layoutInst = null; });
+    layoutInst.run();
+  } catch (_) {
+    layoutRunning = false;
+  }
+}
+
+function resetView() { if (cy) cy.fit(undefined, 28); }
+
+function unpinAll() {
+  if (!cy) return;
+  cy.nodes().unlock();
+  cy.nodes().removeClass('pinned');
+}
+
+// ── Labels ─────────────────────────────────────────────────────────────────────
+function applyLabelVisibility() {
+  if (!cy) return;
+  cy.nodes().toggleClass('no-label', !labelsVisible);
+  cy.edges().toggleClass('no-label', !labelsVisible);
+}
+
+function toggleLabels() {
+  labelsVisible = !labelsVisible;
+  applyLabelVisibility();
+  document.getElementById('lblBtn').classList.toggle('active', !labelsVisible);
+}
+
+// ── Fullscreen ─────────────────────────────────────────────────────────────────
+function toggleFullscreen() {
+  const el = document.getElementById('graph-wrap');
+  if (!document.fullscreenElement) {
+    el.requestFullscreen().then(() => { if (cy) cy.resize(); }).catch(() => {});
+  } else {
+    document.exitFullscreen();
+  }
+}
+document.addEventListener('fullscreenchange', () => { if (cy) { cy.resize(); cy.fit(undefined, 28); } });
+
+// ── Filter nodes ───────────────────────────────────────────────────────────────
+function filterNodes(q) {
+  if (!cy) return;
+  q = q.toLowerCase().trim();
+  if (!q) { cy.elements().removeClass('faded'); return; }
+  const matchedIds = new Set();
+  cy.nodes().forEach(n => {
+    const text = [n.data('labels'), ...Object.values(n.data())].join(' ').toLowerCase();
+    if (text.includes(q)) matchedIds.add(n.id());
+  });
+  cy.nodes().forEach(n => {
+    n[matchedIds.has(n.id()) ? 'removeClass' : 'addClass']('faded');
+  });
+  cy.edges().forEach(e => {
+    const connected = matchedIds.has(e.source().id()) || matchedIds.has(e.target().id());
+    e[connected ? 'removeClass' : 'addClass']('faded');
+  });
+}
+
+// ── Graph stats overlay ────────────────────────────────────────────────────────
+function updateGraphStats() {
+  if (!cy) return;
+  const n = cy.nodes().length, e = cy.edges().length;
+  document.getElementById('graph-stats').textContent = n ? `${n} nodes · ${e} edges` : '';
+}
+
+// ── Color coding ───────────────────────────────────────────────────────────────
+function refreshColorByOptions() {
+  const props = new Set();
+  cy.nodes().forEach(n => {
+    Object.keys(n.data()).forEach(k => {
+      if (!['id', 'dispLabel', 'labels'].includes(k) && typeof n.data(k) !== 'object') props.add(k);
+    });
+  });
+  const sel = document.getElementById('colorBy');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="__label__">Type</option>' +
+    [...props].map(p => `<option value="${esc(p)}"${p === cur ? ' selected' : ''}>${esc(p)}</option>`).join('');
+  if (cur && sel.querySelector(`option[value="${CSS.escape(cur)}"]`)) sel.value = cur;
+}
+
+function updateColors() {
+  if (!cy) return;
+  const mode = document.getElementById('colorBy').value;
+  const seen = new Set();
+  cy.nodes().forEach(n => {
+    const rawKey = mode === '__label__'
+      ? ((n.data('labels') || '?').split(':')[0] || '?')
+      : String(n.data(mode) ?? 'null');
+    const mapKey = mode === '__label__' ? rawKey : (mode + ':' + rawKey);
+    const bg = getColor(mapKey);
+    n.style('background-color', bg);
+    n.style('color', contrastColor(bg));
+    n.style('text-background-color', bg);
+    seen.add(mapKey);
+  });
+  document.getElementById('legend').innerHTML = [...seen].map(k => {
+    const label = mode === '__label__' ? k : k.split(':').slice(1).join(':');
+    return `<div class="li"><div class="ld" style="background:${colorMap[k]}"></div>${esc(label)}</div>`;
+  }).join('');
+}
+
+// ── Resizable split pane ───────────────────────────────────────────────────────
+(() => {
+  const handle = document.getElementById('drag-handle');
+  const left   = document.getElementById('left');
+  let dragging = false;
+  handle.addEventListener('mousedown', e => {
+    dragging = true;
+    handle.classList.add('dragging');
+    document.body.style.cursor     = 'col-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const rect = document.getElementById('main').getBoundingClientRect();
+    const pct  = ((e.clientX - rect.left) / rect.width) * 100;
+    left.style.width = Math.max(20, Math.min(78, pct)) + '%';
+    if (cy) cy.resize();
+  });
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('dragging');
+    document.body.style.cursor     = '';
+    document.body.style.userSelect = '';
+    if (cy) cy.fit(undefined, 28);
+  });
+})();
+
+// ── Keyboard shortcuts ─────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  const inEditor = document.activeElement === document.getElementById('gql');
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    if (e.shiftKey) vizQuery(); else runQuery();
+  }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && !inEditor && cy && cy.$(':selected').length) {
+    cy.$(':selected').remove();
+    updateColors();
+    updateGraphStats();
+  }
+});
+
+// ── Saved Views ────────────────────────────────────────────────────────────────
+
+// Wrap a value in a single-quoted GQL string literal.
+// The GQL grammar has no escape sequences, so we strip any single-quotes from
+// user-provided strings.  Graph names and ULIDs never contain single-quotes.
+function gqlQ(s) {
+  return "'" + String(s).replace(/'/g, '') + "'";
+}
+
+function updateSaveViewBtn() {
+  const btn = document.getElementById('saveViewBtn');
+  if (btn) btn.disabled = !cy || !cy.nodes().length;
+}
+
+// Collect visible node IDs as a comma-separated string.
+// ULIDs are pure Crockford base32 (uppercase alphanumeric) — safe inside any
+// GQL string literal with no nesting or escaping concerns.
+function collectNodeIds() {
+  return cy.nodes().map(n => n.id()).join(',');
+}
+
+// Reconstruct a GQL viz query from a comma-separated node-ID string.
+function nodeIdsToQuery(nodeIds) {
+  const ids = nodeIds.split(',').filter(Boolean);
+  if (!ids.length) return null;
+  const conds = ids.map(id => `id(n) = '${id}'`).join(' OR ');
+  return `MATCH (n) WHERE ${conds} RETURN n`;
+}
+
+async function saveView() {
+  if (!cy || !cy.nodes().length) return;
+  const name = prompt('View name:');
+  if (!name || !name.trim()) return;
+  const cleanName = name.trim();
+  const nodeIds = collectNodeIds();   // comma-separated ULIDs, no quotes inside
+  const created = new Date().toISOString().slice(0, 10);
+  // gqlQ() wraps values in single quotes and strips any stray single-quotes.
+  // node_ids stores ULIDs (alphanumeric+hyphen) — never contains single-quotes.
+  const gql = `INSERT (:SavedView {name: ${gqlQ(cleanName)}, graph: ${gqlQ(currentGraph)}, node_ids: ${gqlQ(nodeIds)}, created: ${gqlQ(created)}})`;
+  const r = await api('/api/query', {
+    method: 'POST',
+    body: JSON.stringify({ graph: '_meta', query: gql })
+  });
+  if (r && r.error) { alert('Save failed: ' + r.error); return; }
+  setStatus('View saved: ' + cleanName);
+}
+
+async function openViewsModal() {
+  const gql = `MATCH (v:SavedView) WHERE v.graph = ${gqlQ(currentGraph)} RETURN v.name, v.node_ids, v.created ORDER BY v.created`;
+  const r = await api('/api/query', {
+    method: 'POST',
+    body: JSON.stringify({ graph: '_meta', query: gql })
+  });
+  const list = document.getElementById('views-list');
+  if (!r || r.error || !r.rows || !r.rows.length) {
+    list.innerHTML = '<div style="color:#484f58;font-size:12px;padding:8px 0">No saved views for this graph.</div>';
+  } else {
+    // Use data-* attributes so arbitrary view names / node-ID strings are never
+    // eval'd as JS inside an onclick="…" attribute (JSON.stringify produces double-
+    // quoted strings that break the attribute boundary).
+    list.innerHTML = r.rows.map(row => {
+      const vname    = row['v.name']     || '';
+      const vnodeIds = row['v.node_ids'] || '';
+      const vcreated = row['v.created']  || '';
+      return `<div class="view-row">` +
+        `<span class="view-name" data-nodeids="${esc(vnodeIds)}" title="Load view">${esc(vname)}</span>` +
+        `<span class="view-date">${esc(vcreated)}</span>` +
+        `<button class="view-del" data-name="${esc(vname)}" title="Delete view">✕</button>` +
+        `</div>`;
+    }).join('');
+    // Attach handlers after the DOM is in place — dataset API decodes HTML entities.
+    list.querySelectorAll('.view-name').forEach(el =>
+      el.addEventListener('click', () => loadView(el.dataset.nodeids)));
+    list.querySelectorAll('.view-del').forEach(el =>
+      el.addEventListener('click', () => deleteView(el.dataset.name)));
+  }
+  document.getElementById('views-modal').classList.add('show');
+}
+
+function closeViewsModal() {
+  document.getElementById('views-modal').classList.remove('show');
+}
+
+function loadView(nodeIds) {
+  const query = nodeIdsToQuery(nodeIds);
+  if (!query) return;
+  closeViewsModal();
+  document.getElementById('gql').value = query;
+  vizQuery();
+}
+
+async function deleteView(name) {
+  const ok = await customConfirm(`Delete view "${name}"?`);
+  if (!ok) return;
+  const gql = `MATCH (v:SavedView) WHERE v.name = ${gqlQ(name)} AND v.graph = ${gqlQ(currentGraph)} DELETE v`;
+  const r = await api('/api/query', {
+    method: 'POST',
+    body: JSON.stringify({ graph: '_meta', query: gql })
+  });
+  if (r && r.error) { alert('Delete failed: ' + r.error); return; }
+  await openViewsModal();
+}
+
+// Close views modal when clicking the backdrop.
+document.getElementById('views-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('views-modal')) closeViewsModal();
+});
+
+init();
+</script>
+</body></html>

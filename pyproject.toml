@@ -1,0 +1,46 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "minigdb"
+version = "0.1.0"
+requires-python = ">=3.8"
+description = "Embeddable property graph database with GQL — the SQLite for graphs"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Jericho McLeod" }]
+keywords = ["graph", "database", "gql", "graphdb", "embedded", "rocksdb", "property-graph"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+]
+
+[project.urls]
+Repository = "https://github.com/jerichomcleod/minigdb"
+"Bug Tracker" = "https://github.com/jerichomcleod/minigdb/issues"
+
+[project.optional-dependencies]
+polars     = ["polars>=0.20"]
+pandas     = ["pandas>=2.0"]
+dataframes = ["polars>=0.20", "pandas>=2.0"]
+
+[tool.maturin]
+features = ["python"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

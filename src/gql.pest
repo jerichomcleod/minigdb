@@ -1,0 +1,328 @@
+// GQL (ISO/IEC 39075) subset grammar for minigdb
+// Resolved relative to src/ at compile time by pest_derive.
+
+// ── Whitespace & comments ──────────────────────────────────────────────────
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* ~ ("\n" | EOI)
+              | "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
+
+// ── Keywords (case-insensitive) ────────────────────────────────────────────
+kw_match   = _{ ^"MATCH" }
+kw_where   = _{ ^"WHERE" }
+kw_return  = _{ ^"RETURN" }
+kw_distinct= _{ ^"DISTINCT" }
+distinct_flag = { ^"DISTINCT" }
+kw_order   = _{ ^"ORDER" }
+kw_by      = _{ ^"BY" }
+kw_limit   = _{ ^"LIMIT" }
+kw_offset  = _{ ^"OFFSET" }
+kw_skip    = _{ ^"SKIP" }
+kw_insert  = _{ ^"INSERT" }
+kw_set     = _{ ^"SET" }
+kw_remove  = _{ ^"REMOVE" }
+kw_delete  = _{ ^"DELETE" }
+kw_detach  = _{ ^"DETACH" }
+// Logical/comparison keywords that appear in the parse tree (non-silent atomic).
+// Being @{} (atomic) prevents implicit whitespace before the word-boundary guard,
+// so !(ASCII_ALPHANUMERIC|"_") sees the char right after the keyword text.
+kw_and    = @{ ^"AND"   ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_or     = @{ ^"OR"    ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_not    = @{ ^"NOT"   ~ !(ASCII_ALPHANUMERIC | "_") }
+// kw_asc / kw_desc appear in the parse tree so the ORDER BY builder can detect direction.
+kw_asc    = @{ ^"ASC" }
+kw_desc   = @{ ^"DESC" }
+// Path-mode keywords are atomic to keep the boundary check immediate (no consumed space).
+kw_walk   = @{ ^"WALK"   ~ !(ASCII_ALPHA | "_") }
+kw_trail  = @{ ^"TRAIL"  ~ !(ASCII_ALPHA | "_") }
+kw_simple = @{ ^"SIMPLE" ~ !(ASCII_ALPHA | "_") }
+// IS / NULL need to be silent (they must not appear in parse tree for is_null_suffix builder).
+// Atomic delegates prevent the implicit-whitespace/lookahead bug while keeping the rules silent.
+kw_is_atom   = @{ ^"IS"    ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_null_atom = @{ ^"NULL"  ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_is   = _{ kw_is_atom }
+kw_null = _{ kw_null_atom }
+// kw_as has the same implicit-whitespace/lookahead bug as kw_and — use atomic delegate.
+kw_as_atom = @{ ^"AS" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_as = _{ kw_as_atom }
+// Remaining silent keywords (no word-boundary issues in their contexts).
+kw_true  = _{ ^"TRUE"  ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_false = _{ ^"FALSE" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_in    = @{ ^"IN"    ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_count   = _{ ^"COUNT" }
+kw_labels  = _{ ^"LABELS" }
+kw_type    = _{ ^"TYPE" }
+kw_id      = _{ ^"ID" }
+kw_create  = _{ ^"CREATE" }
+kw_drop    = _{ ^"DROP" }
+kw_index   = _{ ^"INDEX" }
+kw_on      = _{ ^"ON" }
+kw_show    = _{ ^"SHOW" }
+kw_indexes = _{ ^"INDEXES" | ^"INDICES" }
+// CALL / YIELD keywords (atomic for word-boundary safety).
+kw_call    = @{ ^"CALL"     ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_yield   = @{ ^"YIELD"    ~ !(ASCII_ALPHANUMERIC | "_") }
+// P5 keywords — all atomic for word-boundary safety.
+kw_unwind   = @{ ^"UNWIND"   ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_optional = @{ ^"OPTIONAL" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_union    = @{ ^"UNION"    ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_all      = @{ ^"ALL"      ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_with     = @{ ^"WITH"     ~ !(ASCII_ALPHANUMERIC | "_") }
+// Constraint keywords — atomic for word-boundary safety.
+kw_constraint  = @{ ^"CONSTRAINT"  ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_constraints = @{ ^"CONSTRAINTS" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_unique      = @{ ^"UNIQUE"      ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_type_kw     = @{ ^"TYPE"        ~ !(ASCII_ALPHANUMERIC | "_") }
+// CSV load keywords (simple silent rules; context provides sufficient disambiguation).
+kw_truncate = _{ ^"TRUNCATE" }
+kw_load  = _{ ^"LOAD" }
+kw_csv   = _{ ^"CSV" }
+kw_nodes = _{ ^"NODES" }
+kw_edges = _{ ^"EDGES" }
+kw_from  = _{ ^"FROM" }
+kw_label = _{ ^"LABEL" }
+
+path_mode  = { kw_walk | kw_trail | kw_simple }
+
+// ── Identifiers ────────────────────────────────────────────────────────────
+ident = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// ── Literals ───────────────────────────────────────────────────────────────
+integer  = @{ "-"? ~ ASCII_DIGIT+ }
+float    = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ (^"e" ~ "-"? ~ ASCII_DIGIT+)? }
+string   = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" | "'" ~ (!"'" ~ ANY)* ~ "'" }
+boolean  = @{ kw_true | kw_false }
+null_lit = @{ kw_null }
+
+literal = { float | integer | string | boolean | null_lit }
+
+// ── Top-level statement ────────────────────────────────────────────────────
+// A statement may be a UNION of multiple single statements.
+// single_stmt alternatives are tried in order; match_with_stmt must precede
+// match_stmt (both start with kw_match, but WITH contains an extra clause).
+statement   = { SOI ~ single_stmt ~ (kw_union ~ kw_all? ~ single_stmt)* ~ ";"? ~ EOI }
+single_stmt = {
+    match_with_stmt
+  | match_optional_match_stmt
+  | optional_match_stmt
+  | call_pipeline_stmt
+  | match_stmt
+  | match_insert_stmt
+  | unwind_insert_stmt
+  | unwind_stmt
+  | insert_stmt
+  | set_stmt
+  | remove_stmt
+  | delete_stmt
+  | create_index_stmt
+  | drop_index_stmt
+  | show_indexes_stmt
+  | call_stmt
+  | load_csv_nodes_stmt
+  | load_csv_edges_stmt
+  | truncate_stmt
+  | constraint_stmt
+}
+
+// ── Index management statements ─────────────────────────────────────────────
+// CREATE INDEX ON :Label(property)
+create_index_stmt = { kw_create ~ kw_index ~ kw_on ~ ":" ~ ident ~ "(" ~ ident ~ ")" }
+// DROP INDEX ON :Label(property)
+drop_index_stmt   = { kw_drop ~ kw_index ~ kw_on ~ ":" ~ ident ~ "(" ~ ident ~ ")" }
+// SHOW INDEXES  (also SHOW INDICES)
+show_indexes_stmt = { kw_show ~ kw_indexes }
+
+// ── MATCH statement ────────────────────────────────────────────────────────
+// graph_patterns allows comma-separated disconnected subpatterns (cross-joined).
+match_stmt = { kw_match ~ path_mode? ~ graph_patterns ~ where_clause? ~ return_clause }
+
+graph_pattern = { node_pattern ~ edge_chain* }
+
+edge_chain = { edge_pattern ~ node_pattern }
+
+node_pattern = { "(" ~ node_var? ~ (node_label)* ~ properties_inline? ~ ")" }
+node_var     = { ident }
+node_label   = { ":" ~ ident }
+
+edge_pattern = {
+    left_arrow ~ "[" ~ edge_inner? ~ "]" ~ "-"
+  | "-" ~ "[" ~ edge_inner? ~ "]" ~ right_arrow
+  | "-" ~ "[" ~ edge_inner? ~ "]" ~ "-"
+  | left_arrow
+  | right_arrow
+  | "-"
+}
+
+left_arrow  = _{ "<-" }
+right_arrow = _{ "->" }
+
+edge_inner    = { edge_var? ~ edge_label? ~ properties_inline? ~ quantifier? }
+edge_var      = { ident }
+edge_label    = { ":" ~ ident }
+
+// ── Path quantifiers ───────────────────────────────────────────────────────
+// Examples: *, +, *2, *1..3, *2.., {3}, {1,3}, {1,}
+// quant_range allows an open-ended upper bound: *2.. means "2 or more hops".
+quantifier  = { star_quant | plus_quant | brace_quant }
+star_quant  = { "*" ~ quant_range? }
+plus_quant  = { "+" }
+brace_quant = { "{" ~ nat_int ~ ("," ~ nat_int?)? ~ "}" }
+quant_range = { nat_int ~ (".." ~ nat_int?)? }
+nat_int     = @{ ASCII_DIGIT+ }
+
+properties_inline = { "{" ~ prop_constraint_list? ~ "}" }
+prop_constraint_list = { prop_constraint ~ ("," ~ prop_constraint)* }
+prop_constraint = { ident ~ ":" ~ expr }
+
+where_clause  = { kw_where ~ expr }
+
+// ── RETURN clause ──────────────────────────────────────────────────────────
+return_clause = { kw_return ~ distinct_flag? ~ return_items ~ order_by_clause? ~ (limit_clause | offset_clause)* }
+
+return_items  = { return_item ~ ("," ~ return_item)* }
+return_item   = { "*" | expr ~ (kw_as ~ ident)? }
+
+order_by_clause = { kw_order ~ kw_by ~ order_item ~ ("," ~ order_item)* }
+order_item      = { expr ~ (kw_asc | kw_desc)? }
+
+limit_clause  = { kw_limit ~ expr }
+offset_clause = { (kw_offset | kw_skip) ~ expr }
+
+// ── OPTIONAL MATCH statement ───────────────────────────────────────────────
+// Like MATCH but returns one null row per unmatched binding instead of nothing.
+optional_match_stmt = { kw_optional ~ kw_match ~ path_mode? ~ graph_patterns ~ where_clause? ~ return_clause }
+
+// ── MATCH … OPTIONAL MATCH … RETURN ─────────────────────────────────────────
+// Chained MATCH + one-or-more OPTIONAL MATCH clauses, like a SQL LEFT JOIN.
+// e.g. MATCH (p:Person) OPTIONAL MATCH (p)-[:WORKS_AT]->(c:Company) RETURN p.name, c.name
+optional_match_clause     = { kw_optional ~ kw_match ~ path_mode? ~ graph_patterns ~ where_clause? }
+match_optional_match_stmt = { kw_match ~ path_mode? ~ graph_patterns ~ where_clause? ~ optional_match_clause+ ~ return_clause }
+
+// ── UNWIND statement ────────────────────────────────────────────────────────
+// UNWIND expr AS var RETURN ...
+// Evaluates expr to a List and produces one set of bindings per element.
+unwind_stmt = { kw_unwind ~ expr ~ kw_as ~ ident ~ return_clause }
+
+// ── WITH clause (pipeline projection) ──────────────────────────────────────
+// MATCH pattern [WHERE] WITH projections [WHERE] RETURN ...
+with_clause     = { kw_with ~ distinct_flag? ~ return_items ~ where_clause? }
+match_with_stmt = { kw_match ~ path_mode? ~ graph_patterns ~ where_clause? ~ with_clause ~ return_clause }
+
+// ── MATCH … INSERT statement ────────────────────────────────────────────────
+// Matches existing nodes/edges and inserts new elements (typically edges)
+// using the matched variables as endpoints.  Supports comma-separated
+// disconnected graph patterns so two independent nodes can be matched.
+graph_patterns     = { graph_pattern ~ ("," ~ graph_pattern)* }
+match_insert_stmt  = { kw_match ~ graph_patterns ~ where_clause? ~ kw_insert ~ insert_elements }
+
+// ── INSERT statement ───────────────────────────────────────────────────────
+insert_stmt   = { kw_insert ~ insert_elements }
+insert_elements = { insert_element ~ ("," ~ insert_element)* }
+insert_element = { insert_edge | insert_node }
+
+insert_node = { "(" ~ node_var? ~ (node_label)* ~ properties_inline? ~ ")" }
+
+insert_edge = {
+    "(" ~ ident ~ ")" ~ "-" ~ "[" ~ ident? ~ ":" ~ ident ~ properties_inline? ~ "]" ~ "->" ~ "(" ~ ident ~ ")"
+  | "(" ~ ident ~ ")" ~ "<-" ~ "[" ~ ident? ~ ":" ~ ident ~ properties_inline? ~ "]" ~ "-" ~ "(" ~ ident ~ ")"
+  | "(" ~ ident ~ ")" ~ "-" ~ "[" ~ ident? ~ ":" ~ ident ~ properties_inline? ~ "]" ~ "-" ~ "(" ~ ident ~ ")"
+}
+
+// ── SET statement ──────────────────────────────────────────────────────────
+set_stmt  = { kw_match ~ graph_pattern ~ where_clause? ~ kw_set ~ set_items }
+set_items = { set_item ~ ("," ~ set_item)* }
+set_item  = { ident ~ ("." ~ ident ~ "=" ~ expr | ":" ~ ident) }
+
+// ── REMOVE statement ───────────────────────────────────────────────────────
+remove_stmt  = { kw_match ~ graph_pattern ~ where_clause? ~ kw_remove ~ remove_items }
+remove_items = { remove_item ~ ("," ~ remove_item)* }
+remove_item  = { ident ~ ("." ~ ident | ":" ~ ident) }
+
+// ── CALL statement ─────────────────────────────────────────────────────────
+// CALL algorithmName(key: expr, ...) YIELD col1, col2
+call_stmt    = { kw_call ~ ident ~ "(" ~ call_args? ~ ")" ~ yield_clause? }
+
+// CALL...YIELD piped into MATCH and RETURN (Cypher-style procedure pipeline).
+// e.g. CALL pageRank() YIELD node, score MATCH (n) WHERE n = node RETURN n.name, score
+call_pipeline_match = { kw_match ~ path_mode? ~ graph_patterns ~ where_clause? }
+call_pipeline_stmt  = { kw_call ~ ident ~ "(" ~ call_args? ~ ")" ~ yield_clause ~ call_pipeline_match? ~ return_clause }
+call_args    = { call_arg ~ ("," ~ call_arg)* }
+call_arg     = { ident ~ ":" ~ expr }
+yield_clause = { kw_yield ~ ident_list }
+
+// ── DELETE statement ───────────────────────────────────────────────────────
+// Supports both:
+//   MATCH (n:P) WHERE ... DELETE n
+//   MATCH (n:P) WHERE ... DETACH DELETE n
+//   DELETE MATCH (n:P) WHERE ... n         (legacy form)
+//   DETACH DELETE MATCH (n:P) WHERE ... n  (legacy form)
+delete_stmt = {
+    kw_match ~ graph_pattern ~ where_clause? ~ (kw_detach ~ kw_delete | kw_delete) ~ ident_list
+  | (kw_detach ~ kw_delete | kw_delete) ~ kw_match? ~ graph_pattern? ~ where_clause? ~ ident_list
+}
+ident_list  = { ident ~ ("," ~ ident)* }
+
+// ── Expressions (operator precedence via layered rules) ────────────────────
+expr       = { or_expr }
+or_expr    = { and_expr ~ (kw_or ~ and_expr)* }
+and_expr   = { not_expr ~ (kw_and ~ not_expr)* }
+not_expr   = { kw_not ~ not_expr | compare_expr }
+not_flag     = { kw_not }   // non-silent so its presence is visible in the parse tree
+is_null_suffix = { kw_is ~ not_flag? ~ kw_null }
+compare_expr = { add_expr ~ (cmp_op ~ add_expr | kw_in ~ add_expr | is_null_suffix)? }
+add_expr   = { mul_expr ~ ((add_op) ~ mul_expr)* }
+mul_expr   = { unary_expr ~ ((mul_op) ~ unary_expr)* }
+unary_expr = { "-" ~ unary_expr | primary }
+
+cmp_op = { "<>" | "<=" | ">=" | "<" | ">" | "=" }
+add_op = { "+" | "-" }
+mul_op = { "*" | "/" | "%" }
+
+// ── List literal ────────────────────────────────────────────────────────────
+list_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
+
+primary = {
+    "(" ~ expr ~ ")"
+  | func_call
+  | list_literal
+  | literal
+  | param        // $name — query parameter
+  | prop_access
+  | var_ref
+  | star
+}
+
+// ── Query parameter ─────────────────────────────────────────────────────────
+// $ident — reference to a named parameter passed alongside the query.
+param = @{ "$" ~ ident }
+
+func_call   = { ident ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
+prop_access = { ident ~ "." ~ ident }
+var_ref     = { ident }
+star        = { "*" }
+
+// ── UNWIND … INSERT ──────────────────────────────────────────────────────────
+// Like UNWIND … RETURN but inserts elements for each list row instead.
+// Must appear before unwind_stmt in single_stmt so the parser tries it first.
+unwind_insert_stmt = { kw_unwind ~ expr ~ kw_as ~ ident ~ kw_insert ~ insert_elements }
+
+// ── LOAD CSV statements ──────────────────────────────────────────────────────
+// LOAD CSV NODES FROM 'path/to/nodes.csv' [LABEL LabelName]
+load_csv_nodes_stmt = { kw_load ~ kw_csv ~ kw_nodes ~ kw_from ~ string ~ (kw_label ~ ident)? }
+// LOAD CSV EDGES FROM 'path/to/edges.csv' [LABEL EdgeLabel]
+load_csv_edges_stmt = { kw_load ~ kw_csv ~ kw_edges ~ kw_from ~ string ~ (kw_label ~ ident)? }
+// TRUNCATE — delete all nodes and edges in O(1) via RocksDB range tombstones.
+truncate_stmt = { kw_truncate }
+
+// ── CONSTRAINT statements ────────────────────────────────────────────────────
+// CREATE CONSTRAINT UNIQUE ON :Label(property)
+// CREATE CONSTRAINT TYPE IS INTEGER ON :Label(property)
+// DROP   CONSTRAINT UNIQUE ON :Label(property)
+// SHOW   CONSTRAINTS
+constraint_stmt   = {
+    (kw_create ~ kw_constraint ~ constraint_kind ~ kw_on ~ constraint_target)
+  | (kw_drop   ~ kw_constraint ~ constraint_kind ~ kw_on ~ constraint_target)
+  | (kw_show   ~ kw_constraints)
+}
+constraint_kind   = { kw_unique | (kw_type_kw ~ kw_is_atom ~ value_type) }
+constraint_target = { ":" ~ ident ~ "(" ~ ident ~ ")" }
+value_type        = { ^"INTEGER" | ^"FLOAT" | ^"STRING" | ^"BOOLEAN" }

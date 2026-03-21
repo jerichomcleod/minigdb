@@ -1,0 +1,127 @@
+name: Release
+
+# Triggered by pushing a version tag: git tag v0.1.0 && git push --tags
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  # ── Build wheels for all supported platforms ─────────────────────────────
+  build-wheels:
+    name: Wheel — ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — built inside manylinux_2_28 container (glibc 2.28+)
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64
+            manylinux: "2_28"
+
+          # Linux aarch64 — cross-compiled from x86_64 runner via QEMU
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64
+            manylinux: "2_28"
+
+          # macOS universal2 — single fat wheel for Intel + Apple Silicon
+          - name: macos-universal
+            os: macos-latest
+            target: universal2-apple-darwin
+            manylinux: ""
+
+          # Windows x86_64
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64
+            manylinux: ""
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # RocksDB static build requires cmake. The manylinux_2_28 container ships
+      # with cmake, but an explicit install guards against container changes.
+      - name: Install cmake (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --features python
+          manylinux: ${{ matrix.manylinux }}
+          # cmake is available in the manylinux container via the system package
+          # manager; rocksdb = { features = ["static"] } compiles it from source.
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist/*.whl
+
+  # ── Build source distribution (sdist) ────────────────────────────────────
+  # Users on unsupported platforms can install from source with:
+  #   pip install minigdb --no-binary minigdb
+  # They need: Rust toolchain + cmake + C++ compiler.
+  build-sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # ── Publish to PyPI ───────────────────────────────────────────────────────
+  # Uses OIDC trusted publishing — no API token secret required.
+  # One-time setup on PyPI: Account → Publishing → Add publisher
+  #   Project name: minigdb
+  #   Owner:        jerichomcleod
+  #   Repository:   minigdb
+  #   Workflow:     release.yml
+  #   Environment:  pypi
+  #
+  # In GitHub: Settings → Environments → New → name it "pypi"
+  # (Optionally add a required reviewer as a manual approval gate.)
+  publish:
+    name: Publish to PyPI
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # required for OIDC trusted publishing
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "wheels-*"
+          merge-multiple: true
+          path: dist
+
+      - name: Download sdist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: PyO3/maturin-action@v1
+        with:
+          command: upload
+          args: --non-interactive --skip-existing dist/**

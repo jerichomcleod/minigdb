@@ -14,53 +14,44 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64 — built inside manylinux_2_28 container (glibc 2.28+)
-          # python-version is empty: the container manages its own Python interpreter.
+          # Linux x86_64 — built inside quay.io/pypa/manylinux_2_28_x86_64 (AlmaLinux 8).
+          # The container has Python; llvm-toolset provides libclang needed by zstd-sys bindgen.
           - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64
             manylinux: "2_28"
-            python-version: ""
             python-args: ""
+            before-script: yum install -y cmake llvm-toolset
 
-          # Linux aarch64 — cross-compiled from x86_64 runner via QEMU
-          # python-version is empty: PYO3_CROSS_PYTHON_VERSION handles the ABI target.
+          # Linux aarch64 — cross-compiled via ghcr.io/rust-cross/manylinux_2_28-cross:aarch64.
+          # That container has no Python, so we install python3.12 and pass it explicitly.
           - name: linux-aarch64
             os: ubuntu-latest
             target: aarch64
             manylinux: "2_28"
-            python-version: ""
-            python-args: ""
+            python-args: "-i python3.12"
+            before-script: yum install -y cmake llvm-toolset python3.12 python3.12-devel
 
-          # macOS universal2 — single fat wheel for Intel + Apple Silicon.
-          # Pinned to Python 3.12: GitHub macOS runners ship Python 3.14 which is
-          # newer than PyO3 0.22's maximum supported version (3.13).
+          # macOS universal2 — fat wheel covering Intel + Apple Silicon.
+          # abi3-py39 uses the stable Python C API, so Python 3.14 on the runner is fine.
           - name: macos-universal
             os: macos-latest
             target: universal2-apple-darwin
             manylinux: ""
-            python-version: "3.12"
-            python-args: "-i python3.12"
+            python-args: ""
+            before-script: ""
 
-          # Windows x86_64 — same Python pin as macOS.
+          # Windows x86_64 — abi3-py39 handles any Python version on the runner.
           - name: windows-x86_64
             os: windows-latest
             target: x86_64
             manylinux: ""
-            python-version: "3.12"
-            python-args: "-i python3.12"
+            python-args: ""
+            before-script: ""
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      # Pin the Python version on macOS/Windows so maturin doesn't pick up
-      # Python 3.14 (newer than PyO3 0.22 supports).  Skipped for Linux because
-      # the manylinux container manages its own interpreter.
-      - uses: actions/setup-python@v5
-        if: matrix.python-version != ''
-        with:
-          python-version: ${{ matrix.python-version }}
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1
@@ -68,17 +59,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --features python ${{ matrix.python-args }}
           manylinux: ${{ matrix.manylinux }}
-          # Install build dependencies inside the manylinux container.
-          # cmake:        required by librocksdb-sys (compiles RocksDB from source)
-          # clang/clang-devel: required by zstd-sys (uses bindgen >=0.72 which needs libclang)
-          before-script-linux: |
-            yum install -y cmake clang clang-devel
-        env:
-          # Required for aarch64 cross-compilation: the cross container has no Python
-          # interpreter, so maturin cannot find one automatically.  This env var tells
-          # maturin which Python ABI version to target without needing a live interpreter.
-          # Kept in sync with the python-version pin used for macOS/Windows.
-          PYO3_CROSS_PYTHON_VERSION: "3.12"
+          before-script-linux: ${{ matrix.before-script }}
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
@@ -110,15 +91,6 @@ jobs:
 
   # ── Publish to PyPI ───────────────────────────────────────────────────────
   # Uses OIDC trusted publishing — no API token secret required.
-  # One-time setup on PyPI: Account → Publishing → Add publisher
-  #   Project name: minigdb
-  #   Owner:        jerichomcleod
-  #   Repository:   minigdb
-  #   Workflow:     release.yml
-  #   Environment:  pypi
-  #
-  # In GitHub: Settings → Environments → New → name it "pypi"
-  # (Optionally add a required reviewer as a manual approval gate.)
   publish:
     name: Publish to PyPI
     needs: [build-wheels, build-sdist]

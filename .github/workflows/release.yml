@@ -14,52 +14,64 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64 — built inside quay.io/pypa/manylinux_2_28_x86_64 (AlmaLinux 8).
-          # The container has Python; llvm-toolset provides libclang needed by zstd-sys bindgen.
+          # Linux x86_64 — quay.io/pypa/manylinux_2_28_x86_64 (AlmaLinux 8).
+          # zstd removed from rocksdb features → no zstd-sys → no bindgen → no libclang needed.
+          # cmake is required by librocksdb-sys.
           - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64
             manylinux: "2_28"
-            python-args: ""
-            before-script: yum install -y cmake llvm-toolset
+            qemu: false
 
-          # Linux aarch64 — cross-compiled via ghcr.io/rust-cross/manylinux_2_28-cross:aarch64.
-          # That container has no Python, so we install python3.12 and pass it explicitly.
+          # Linux aarch64 — uses QEMU + the native quay.io/pypa/manylinux_2_28_aarch64
+          # container (which has Python pre-installed) instead of the cross-compilation
+          # container (which has no Python and requires -i).
           - name: linux-aarch64
             os: ubuntu-latest
             target: aarch64
             manylinux: "2_28"
-            python-args: "-i python3.12"
-            before-script: yum install -y cmake llvm-toolset python3.12 python3.12-devel
+            qemu: true
 
-          # macOS universal2 — fat wheel covering Intel + Apple Silicon.
-          # abi3-py39 uses the stable Python C API, so Python 3.14 on the runner is fine.
+          # macOS universal2 — fat wheel for Intel + Apple Silicon.
+          # PYO3_USE_ABI3_FORWARD_COMPATIBILITY allows building with Python 3.14
+          # using the stable ABI (abi3-py39 is already set in Cargo.toml).
           - name: macos-universal
             os: macos-latest
             target: universal2-apple-darwin
             manylinux: ""
-            python-args: ""
-            before-script: ""
+            qemu: false
 
-          # Windows x86_64 — abi3-py39 handles any Python version on the runner.
+          # Windows x86_64.
           - name: windows-x86_64
             os: windows-latest
             target: x86_64
             manylinux: ""
-            python-args: ""
-            before-script: ""
+            qemu: false
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
+      # Required for linux-aarch64: lets maturin-action use the native aarch64
+      # manylinux container (which has Python) instead of the cross-compilation
+      # container (which does not).
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.qemu
+        with:
+          platforms: aarch64
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --features python ${{ matrix.python-args }}
+          args: --release --out dist --features python
           manylinux: ${{ matrix.manylinux }}
-          before-script-linux: ${{ matrix.before-script }}
+        env:
+          # Allows PyO3 0.22 to build against Python versions newer than its
+          # declared maximum (3.13) using the stable ABI.  Required on macOS/Windows
+          # runners that have Python 3.14.  Harmless on Linux (env vars are not
+          # forwarded into the manylinux Docker container).
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4

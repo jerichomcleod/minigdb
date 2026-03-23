@@ -1596,7 +1596,12 @@ fn eval_binop(l: Value, op: BinOp, r: Value) -> Result<Value, DbError> {
             }
             numeric_op(l, r, |a, b| a / b, |a, b| a / b)
         }
-        BinOp::Mod => numeric_op(l, r, |a, b| a % b, |a, b| a % b),
+        BinOp::Mod => {
+            if matches!(r, Value::Int(0)) {
+                return Err(DbError::Query("modulo by zero".into()));
+            }
+            numeric_op(l, r, |a, b| a % b, |a, b| a % b)
+        }
         BinOp::In => {
             let found = match &r {
                 Value::List(items) => items.contains(&l),
@@ -1686,7 +1691,12 @@ fn eval_function(
                               bindings, graph)?;
             match v {
                 Value::Int(i) => Ok(Value::Int(i)),
-                Value::Float(f) => Ok(Value::Int(f as i64)),
+                Value::Float(f) => {
+                    if !f.is_finite() {
+                        return Err(DbError::Query(format!("cannot convert non-finite float {f} to integer")));
+                    }
+                    Ok(Value::Int(f as i64))
+                }
                 Value::String(s) => s.parse::<i64>().map(Value::Int)
                     .map_err(|_| DbError::Query(format!("cannot convert '{s}' to integer"))),
                 _ => Ok(Value::Null),
@@ -1696,7 +1706,7 @@ fn eval_function(
             let v = eval_expr(args.first().ok_or_else(|| DbError::Query("size() requires 1 arg".into()))?,
                               bindings, graph)?;
             match v {
-                Value::String(s) => Ok(Value::Int(s.len() as i64)),
+                Value::String(s) => Ok(Value::Int(s.chars().count() as i64)),
                 Value::List(l) => Ok(Value::Int(l.len() as i64)),
                 _ => Ok(Value::Null),
             }

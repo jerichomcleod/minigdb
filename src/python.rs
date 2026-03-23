@@ -943,6 +943,8 @@ impl MiniGdbClient {
 /// ```
 #[pyfunction]
 fn connect(addr: &str) -> PyResult<MiniGdbClient> {
+    use std::io::BufRead;
+
     let stream = std::net::TcpStream::connect(addr)
         .map_err(|e| PyOSError::new_err(format!("cannot connect to {addr}: {e}")))?;
     // Clone the stream so we have separate handles for reading and writing,
@@ -950,7 +952,15 @@ fn connect(addr: &str) -> PyResult<MiniGdbClient> {
     let writer = stream
         .try_clone()
         .map_err(|e| PyOSError::new_err(e.to_string()))?;
-    let reader = std::io::BufReader::new(stream);
+    let mut reader = std::io::BufReader::new(stream);
+    // Protocol v2: the server always sends a hello frame immediately on
+    // connection.  Consume it before the caller issues any queries, otherwise
+    // every response would be shifted by one (the first query reads the hello,
+    // the second reads the first query's response, etc.).
+    let mut hello = String::new();
+    reader
+        .read_line(&mut hello)
+        .map_err(|e| PyOSError::new_err(format!("reading hello from {addr}: {e}")))?;
     Ok(MiniGdbClient { reader, writer, next_id: 0 })
 }
 

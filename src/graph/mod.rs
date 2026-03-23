@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::rocks_store::RocksStore;
-use crate::transaction::operation::{Operation, PropertyTarget};
+use crate::transaction::operation::Operation;
 use crate::types::{ulid_new, DbError, Edge, EdgeId, Node, NodeId, Value};
 
 /// A declared property index: index all nodes with `label` on the value of `property`.
@@ -49,6 +49,19 @@ impl Drop for CleanupDir {
 ///
 /// **Field drop order matters**: `store` must be declared *before* `_owned_dir`
 /// so that RocksDB is closed before the temp directory is deleted.
+/// Pre-transaction snapshot used for rollback.
+///
+/// Captured at `BEGIN`.  All writes during the transaction go directly to
+/// RocksDB so reads always see the latest state ("read your own writes").
+/// On `ROLLBACK`, the graph's RocksDB data is wiped and rebuilt from this
+/// snapshot.  On `COMMIT`, the snapshot is simply discarded.
+struct TransactionSnapshot {
+    nodes: Vec<crate::types::Node>,
+    edges: Vec<crate::types::Edge>,
+    index_defs: Vec<PropertyIndexDef>,
+    constraint_defs: Vec<constraints::ConstraintDef>,
+}
+
 pub struct Graph {
     /// RocksDB-backed store — the single source of truth.
     /// MUST be declared first so it drops before `_owned_dir`.
@@ -63,10 +76,13 @@ pub struct Graph {
     /// from RocksDB on `open()` and updated atomically (save to meta CF) on every
     /// `add_constraint` / `remove_constraint` call.
     pub(crate) constraint_defs: Vec<constraints::ConstraintDef>,
-    /// Buffered ops for an active explicit transaction.
+    /// Marker for an active explicit transaction.
     /// `None` = auto-commit mode; `Some(_)` = inside BEGIN…COMMIT.
-    /// When `Some`, `apply_*` methods buffer ops here instead of writing to RocksDB.
+    /// Writes always go to RocksDB immediately; this field only tracks the
+    /// transaction boundary so that `commit` / `rollback` can be validated.
     txn_pending_ops: Option<Vec<Operation>>,
+    /// Pre-BEGIN snapshot, used to restore state on ROLLBACK.
+    txn_snapshot: Option<Box<TransactionSnapshot>>,
     /// Transient mapping from user-supplied CSV `:ID` strings to their assigned
     /// [`NodeId`]s.  Populated by `LOAD CSV NODES`; consumed by `LOAD CSV EDGES`.
     /// Not persisted to disk.  Cleared by [`Graph::clear_csv_id_map`].
@@ -99,6 +115,7 @@ impl Graph {
             index_defs: Vec::new(),
             constraint_defs: Vec::new(),
             txn_pending_ops: None,
+            txn_snapshot: None,
             csv_id_map: std::collections::HashMap::new(),
             _owned_dir: Some(CleanupDir(dir)),
         }
@@ -115,6 +132,7 @@ impl Graph {
             index_defs,
             constraint_defs,
             txn_pending_ops: None,
+            txn_snapshot: None,
             csv_id_map: std::collections::HashMap::new(),
             _owned_dir: None,
         };
@@ -436,29 +454,59 @@ impl Graph {
     // ── Transaction API ───────────────────────────────────────────────────────
 
     /// Begin an explicit transaction.  Returns an error if already in one.
+    ///
+    /// A snapshot of the current graph state is saved so that `rollback_transaction`
+    /// can restore it exactly.  All writes during the transaction go directly to
+    /// RocksDB, making them immediately visible to reads within the same transaction.
     pub fn begin_transaction(&mut self) -> Result<(), DbError> {
         if self.txn_pending_ops.is_some() {
             return Err(DbError::Query("transaction already active".into()));
         }
+        self.txn_snapshot = Some(Box::new(TransactionSnapshot {
+            nodes: self.all_nodes(),
+            edges: self.all_edges(),
+            index_defs: self.index_defs.clone(),
+            constraint_defs: self.constraint_defs.clone(),
+        }));
         self.txn_pending_ops = Some(Vec::new());
         Ok(())
     }
 
-    /// Commit the current transaction: apply all buffered ops to RocksDB atomically.
+    /// Commit the current transaction: discard the rollback snapshot.
     /// Returns an error if no transaction is active.
     pub fn commit_transaction(&mut self) -> Result<(), DbError> {
-        let pending = self.txn_pending_ops
+        self.txn_pending_ops
             .take()
             .ok_or_else(|| DbError::Query("no active transaction".into()))?;
-        // txn_pending_ops is now None — apply_* methods write directly to RocksDB.
-        crate::storage::apply_ops(self, &pending)
+        self.txn_snapshot = None;
+        Ok(())
     }
 
-    /// Roll back the current transaction: discard all buffered ops (O(1) — nothing was written).
+    /// Roll back the current transaction: restore the pre-BEGIN snapshot.
     /// Returns an error if no transaction is active.
     pub fn rollback_transaction(&mut self) -> Result<(), DbError> {
         if self.txn_pending_ops.take().is_none() {
             return Err(DbError::Query("no active transaction".into()));
+        }
+        if let Some(snap) = self.txn_snapshot.take() {
+            // Wipe all data written during the transaction.
+            self.store.clear_all()?;
+            // Restore in-memory defs first so constraint/index checks during
+            // re-insert use the pre-transaction definitions.
+            self.index_defs = snap.index_defs;
+            self.constraint_defs = snap.constraint_defs;
+            // Re-insert all pre-transaction nodes and edges.
+            for node in snap.nodes {
+                ops::insert_node(self, node)?;
+            }
+            for edge in snap.edges {
+                ops::insert_edge(self, edge)?;
+            }
+            // Re-stamp the edge-label-index sentinel (clear_all removed it).
+            let _ = self.store.put_meta(
+                crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT,
+                b"1",
+            );
         }
         Ok(())
     }
@@ -471,19 +519,11 @@ impl Graph {
     // ── Write API (apply_* methods called by ops and WAL replay) ─────────────
 
     pub(crate) fn apply_insert_node(&mut self, node: Node) {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::CreateNode { node });
-        } else {
-            let _ = ops::insert_node(self, node);
-        }
+        let _ = ops::insert_node(self, node);
     }
 
     pub(crate) fn apply_insert_edge(&mut self, edge: Edge) {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::CreateEdge { edge });
-        } else {
-            let _ = ops::insert_edge(self, edge);
-        }
+        let _ = ops::insert_edge(self, edge);
     }
 
     pub(crate) fn apply_set_node_property(
@@ -492,12 +532,7 @@ impl Graph {
         key: String,
         value: Value,
     ) -> Result<(), DbError> {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::SetProperty { target: PropertyTarget::Node(node_id), key, value });
-            Ok(())
-        } else {
-            ops::set_node_property(self, node_id, key, value)
-        }
+        ops::set_node_property(self, node_id, key, value)
     }
 
     pub(crate) fn apply_set_edge_property(
@@ -506,12 +541,7 @@ impl Graph {
         key: String,
         value: Value,
     ) -> Result<(), DbError> {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::SetProperty { target: PropertyTarget::Edge(edge_id), key, value });
-            Ok(())
-        } else {
-            ops::set_edge_property(self, edge_id, key, value)
-        }
+        ops::set_edge_property(self, edge_id, key, value)
     }
 
     pub(crate) fn apply_remove_node_property(
@@ -519,12 +549,7 @@ impl Graph {
         node_id: NodeId,
         key: &str,
     ) -> Result<(), DbError> {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::RemoveProperty { target: PropertyTarget::Node(node_id), key: key.to_string() });
-            Ok(())
-        } else {
-            ops::remove_node_property(self, node_id, key)
-        }
+        ops::remove_node_property(self, node_id, key)
     }
 
     pub(crate) fn apply_remove_edge_property(
@@ -532,12 +557,7 @@ impl Graph {
         edge_id: EdgeId,
         key: &str,
     ) -> Result<(), DbError> {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::RemoveProperty { target: PropertyTarget::Edge(edge_id), key: key.to_string() });
-            Ok(())
-        } else {
-            ops::remove_edge_property(self, edge_id, key)
-        }
+        ops::remove_edge_property(self, edge_id, key)
     }
 
     pub(crate) fn apply_add_label(
@@ -545,12 +565,7 @@ impl Graph {
         node_id: NodeId,
         label: String,
     ) -> Result<(), DbError> {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::AddLabel { node_id, label });
-            Ok(())
-        } else {
-            ops::add_node_label(self, node_id, label)
-        }
+        ops::add_node_label(self, node_id, label)
     }
 
     pub(crate) fn apply_remove_label(
@@ -558,55 +573,27 @@ impl Graph {
         node_id: NodeId,
         label: &str,
     ) -> Result<(), DbError> {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::RemoveLabel { node_id, label: label.to_string() });
-            Ok(())
-        } else {
-            ops::remove_node_label(self, node_id, label)
-        }
+        ops::remove_node_label(self, node_id, label)
     }
 
     pub(crate) fn apply_delete_node(&mut self, node_id: NodeId) -> Result<(), DbError> {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::DeleteNode { node_id });
-            Ok(())
-        } else {
-            ops::delete_node(self, node_id)
-        }
+        ops::delete_node(self, node_id)
     }
 
     pub(crate) fn apply_delete_node_detach(&mut self, node_id: NodeId) -> Result<(), DbError> {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::DeleteNodeDetach { node_id });
-            Ok(())
-        } else {
-            ops::delete_node_detach(self, node_id)
-        }
+        ops::delete_node_detach(self, node_id)
     }
 
     pub(crate) fn apply_delete_edge(&mut self, edge_id: EdgeId) -> Result<(), DbError> {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::DeleteEdge { edge_id });
-            Ok(())
-        } else {
-            ops::delete_edge(self, edge_id)
-        }
+        ops::delete_edge(self, edge_id)
     }
 
     pub(crate) fn apply_create_index(&mut self, label: &str, property: &str) {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::CreateIndex { label: label.to_string(), property: property.to_string() });
-        } else {
-            self.create_property_index(label, property);
-        }
+        self.create_property_index(label, property);
     }
 
     pub(crate) fn apply_drop_index(&mut self, label: &str, property: &str) {
-        if let Some(ref mut buf) = self.txn_pending_ops {
-            buf.push(Operation::DropIndex { label: label.to_string(), property: property.to_string() });
-        } else {
-            self.drop_property_index(label, property);
-        }
+        self.drop_property_index(label, property);
     }
 
     /// No-op: RocksDB indexes are always consistent.
@@ -795,8 +782,9 @@ mod tests {
         assert!(g.is_in_transaction());
         let id = g.alloc_node_id();
         g.apply_insert_node(make_node(id, &["Person"], Properties::new()));
-        // Not visible yet (buffered).
-        assert_eq!(g.node_count(), 0);
+        // Write is immediately visible within the transaction (read-your-own-writes).
+        assert_eq!(g.node_count(), 1);
+        assert!(g.get_node(id).is_some());
         g.commit_transaction().unwrap();
         assert!(!g.is_in_transaction());
         assert_eq!(g.node_count(), 1);

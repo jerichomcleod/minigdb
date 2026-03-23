@@ -179,6 +179,11 @@ pub fn load_nodes_csv<R: Read>(
 
         // ── Record the id_map entry ─────────────────────────────────────────
         if let Some(cid) = csv_id {
+            if result.id_map.contains_key(&cid) {
+                return Err(DbError::Parse(format!(
+                    "duplicate :ID value '{cid}' in node CSV"
+                )));
+            }
             result.id_map.insert(cid, node_id);
         }
         result.inserted += 1;

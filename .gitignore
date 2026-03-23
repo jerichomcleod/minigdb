@@ -37,6 +37,7 @@ venv/
 # Internal project files not for public repo
 issues.md
 completed.md
+notes.md
 
 # Claude Code session data
 .claude/

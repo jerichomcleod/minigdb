@@ -59,9 +59,10 @@ tr:hover td{background:#161b22}
 .id-link:hover{color:#79c0ff}
 /* right / graph */
 #right{flex:1;display:flex;flex-direction:column;overflow:hidden}
-#gtbar{background:#161b22;border-bottom:1px solid #30363d;padding:5px 8px;display:flex;align-items:center;gap:6px;flex-shrink:0;flex-wrap:wrap}
-#gtbar label{color:#8b949e;font-size:11px}
-#filter-input{width:100px;font-size:11px;padding:2px 6px}
+#gtbar{background:#161b22;border-bottom:1px solid #30363d;padding:5px 8px;display:grid;grid-template-columns:auto auto auto auto;gap:4px 10px;align-items:center;flex-shrink:0}
+#gtbar label{color:#8b949e;font-size:11px;white-space:nowrap}
+.gtcol{display:flex;align-items:center;gap:4px}
+#filter-input{width:110px;font-size:11px;padding:2px 6px}
 #graph-wrap{flex:1;position:relative;overflow:hidden}
 #cy{position:absolute;inset:0;background:#0d1117}
 /* graph overlay text */
@@ -87,7 +88,7 @@ tr:hover td{background:#161b22}
 #login input{display:block;width:100%;margin-bottom:10px;padding:7px 10px;font-size:13px}
 #lerr{color:#f85149;font-size:12px;margin-top:6px;min-height:18px}
 /* custom modal */
-#modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:200}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:300}
 #modal.show{display:flex}
 #modal-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:22px 24px;min-width:260px;max-width:400px}
 #modal-msg{color:#c9d1d9;font-size:13px;margin-bottom:16px;line-height:1.5;white-space:pre-line}
@@ -179,25 +180,47 @@ tr:hover td{background:#161b22}
 
   <div id="right">
     <div id="gtbar">
-      <label>Layout:</label>
-      <select id="layoutSel" onchange="runLayout(true)">
-        <option value="fcose">Force-directed</option>
-        <option value="circle">Circular</option>
-        <option value="concentric">Concentric</option>
-        <option value="dagre">Hierarchical</option>
-        <option value="multipartite">Multipartite</option>
-        <option value="grid">Grid</option>
-      </select>
-      <label>Color:</label>
-      <select id="colorBy" onchange="updateColors()"><option value="__label__">Type</option></select>
-      <button onclick="runLayout(true)" title="Re-run layout">⟳</button>
-      <button onclick="resetView()" title="Fit all nodes in view">⛶</button>
-      <button onclick="unpinAll()" title="Release all pinned nodes">⊘ Unpin</button>
-      <button id="lblBtn" onclick="toggleLabels()" title="Show/hide labels">⌗ Labels</button>
-      <button onclick="toggleFullscreen()" title="Fullscreen graph">⤢</button>
-      <input id="filter-input" placeholder="Filter nodes…" oninput="filterNodes(this.value)" title="Filter nodes by label or property">
-      <button id="saveViewBtn" onclick="saveView()" title="Save current graph view as a named view" disabled>💾 Save View</button>
-      <button onclick="openViewsModal()" title="Load or manage saved views">📂 Views</button>
+      <!-- Col 1 row 1: Layout selector -->
+      <div class="gtcol"><label>Layout</label>
+        <select id="layoutSel" onchange="runLayout(true)">
+          <option value="fcose">Force-directed</option>
+          <option value="circle">Circular</option>
+          <option value="concentric">Concentric</option>
+          <option value="dagre">Hierarchical</option>
+          <option value="multipartite">Multipartite</option>
+          <option value="grid">Grid</option>
+        </select>
+      </div>
+      <!-- Col 2 row 1: Save View -->
+      <div class="gtcol">
+        <button id="saveViewBtn" onclick="saveView()" title="Save current graph view as a named view" disabled>💾 Save View</button>
+      </div>
+      <!-- Col 3 row 1: Re-run + Unpin -->
+      <div class="gtcol">
+        <button onclick="runLayout(true)" title="Re-run layout">⟳</button>
+        <button onclick="unpinAll()" title="Release all pinned nodes">⊘</button>
+      </div>
+      <!-- Col 4 row 1: Fullscreen -->
+      <div class="gtcol">
+        <button onclick="toggleFullscreen()" title="Fullscreen graph">⤢</button>
+      </div>
+      <!-- Col 1 row 2: Color selector -->
+      <div class="gtcol"><label>Color</label>
+        <select id="colorBy" onchange="updateColors()"><option value="__label__">Type</option></select>
+      </div>
+      <!-- Col 2 row 2: Views -->
+      <div class="gtcol">
+        <button onclick="openViewsModal()" title="Load or manage saved views">📂 Views</button>
+      </div>
+      <!-- Col 3 row 2: Fit + Labels -->
+      <div class="gtcol">
+        <button onclick="resetView()" title="Fit all nodes in view">⛶</button>
+        <button id="lblBtn" onclick="toggleLabels()" title="Show/hide labels">⌗</button>
+      </div>
+      <!-- Col 4 row 2: Filter input -->
+      <div class="gtcol">
+        <input id="filter-input" placeholder="Filter nodes…" oninput="filterNodes(this.value)" title="Filter nodes by label or property">
+      </div>
     </div>
 
     <div id="graph-wrap">
@@ -1001,19 +1024,24 @@ function updateSaveViewBtn() {
   if (btn) btn.disabled = !cy || !cy.nodes().length;
 }
 
-// Collect visible node IDs as a comma-separated string.
+// Collect visible node and edge IDs.
 // ULIDs are pure Crockford base32 (uppercase alphanumeric) — safe inside any
 // GQL string literal with no nesting or escaping concerns.
-function collectNodeIds() {
-  return cy.nodes().map(n => n.id()).join(',');
+function collectGraphIds() {
+  return {
+    nodeIds: cy.nodes().map(n => n.id()).join(','),
+    edgeIds: cy.edges().map(e => e.id()).join(',')
+  };
 }
 
-// Reconstruct a GQL viz query from a comma-separated node-ID string.
-function nodeIdsToQuery(nodeIds) {
-  const ids = nodeIds.split(',').filter(Boolean);
-  if (!ids.length) return null;
-  const conds = ids.map(id => `id(n) = '${id}'`).join(' OR ');
-  return `MATCH (n) WHERE ${conds} RETURN n`;
+// Build an UNWIND query that returns all node and edge IDs as plain values.
+// /api/viz's enrich() scans every ULID string in result rows and resolves each
+// as a node or edge, so returning edge IDs as plain values is sufficient.
+function graphIdsToQuery(nodeIds, edgeIds) {
+  const all = [...nodeIds.split(','), ...edgeIds.split(',')].filter(Boolean);
+  if (!all.length) return null;
+  const items = all.map(id => `'${id}'`).join(',');
+  return `UNWIND [${items}] AS elem RETURN elem`;
 }
 
 async function saveView() {
@@ -1021,11 +1049,11 @@ async function saveView() {
   const name = prompt('View name:');
   if (!name || !name.trim()) return;
   const cleanName = name.trim();
-  const nodeIds = collectNodeIds();   // comma-separated ULIDs, no quotes inside
+  const { nodeIds, edgeIds } = collectGraphIds();
   const created = new Date().toISOString().slice(0, 10);
   // gqlQ() wraps values in single quotes and strips any stray single-quotes.
-  // node_ids stores ULIDs (alphanumeric+hyphen) — never contains single-quotes.
-  const gql = `INSERT (:SavedView {name: ${gqlQ(cleanName)}, graph: ${gqlQ(currentGraph)}, node_ids: ${gqlQ(nodeIds)}, created: ${gqlQ(created)}})`;
+  // node_ids / edge_ids store ULIDs (alphanumeric+hyphen) — never contain single-quotes.
+  const gql = `INSERT (:SavedView {name: ${gqlQ(cleanName)}, graph: ${gqlQ(currentGraph)}, node_ids: ${gqlQ(nodeIds)}, edge_ids: ${gqlQ(edgeIds)}, created: ${gqlQ(created)}})`;
   const r = await api('/api/query', {
     method: 'POST',
     body: JSON.stringify({ graph: '_meta', query: gql })
@@ -1035,7 +1063,7 @@ async function saveView() {
 }
 
 async function openViewsModal() {
-  const gql = `MATCH (v:SavedView) WHERE v.graph = ${gqlQ(currentGraph)} RETURN v.name, v.node_ids, v.created ORDER BY v.created`;
+  const gql = `MATCH (v:SavedView) WHERE v.graph = ${gqlQ(currentGraph)} RETURN v.name, v.node_ids, v.edge_ids, v.created ORDER BY v.created`;
   const r = await api('/api/query', {
     method: 'POST',
     body: JSON.stringify({ graph: '_meta', query: gql })
@@ -1044,22 +1072,23 @@ async function openViewsModal() {
   if (!r || r.error || !r.rows || !r.rows.length) {
     list.innerHTML = '<div style="color:#484f58;font-size:12px;padding:8px 0">No saved views for this graph.</div>';
   } else {
-    // Use data-* attributes so arbitrary view names / node-ID strings are never
+    // Use data-* attributes so arbitrary view names / ID strings are never
     // eval'd as JS inside an onclick="…" attribute (JSON.stringify produces double-
     // quoted strings that break the attribute boundary).
     list.innerHTML = r.rows.map(row => {
       const vname    = row['v.name']     || '';
       const vnodeIds = row['v.node_ids'] || '';
+      const vedgeIds = row['v.edge_ids'] || '';
       const vcreated = row['v.created']  || '';
       return `<div class="view-row">` +
-        `<span class="view-name" data-nodeids="${esc(vnodeIds)}" title="Load view">${esc(vname)}</span>` +
+        `<span class="view-name" data-nodeids="${esc(vnodeIds)}" data-edgeids="${esc(vedgeIds)}" title="Load view">${esc(vname)}</span>` +
         `<span class="view-date">${esc(vcreated)}</span>` +
         `<button class="view-del" data-name="${esc(vname)}" title="Delete view">✕</button>` +
         `</div>`;
     }).join('');
     // Attach handlers after the DOM is in place — dataset API decodes HTML entities.
     list.querySelectorAll('.view-name').forEach(el =>
-      el.addEventListener('click', () => loadView(el.dataset.nodeids)));
+      el.addEventListener('click', () => loadView(el.dataset.nodeids, el.dataset.edgeids)));
     list.querySelectorAll('.view-del').forEach(el =>
       el.addEventListener('click', () => deleteView(el.dataset.name)));
   }
@@ -1070,8 +1099,8 @@ function closeViewsModal() {
   document.getElementById('views-modal').classList.remove('show');
 }
 
-function loadView(nodeIds) {
-  const query = nodeIdsToQuery(nodeIds);
+function loadView(nodeIds, edgeIds) {
+  const query = graphIdsToQuery(nodeIds || '', edgeIds || '');
   if (!query) return;
   closeViewsModal();
   document.getElementById('gql').value = query;

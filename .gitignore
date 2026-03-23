@@ -1,7 +1,42 @@
+# Rust build output
 /target
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# minigdb runtime files (WAL, snapshots, REPL history)
 /minigdb.wal
 /minigdb.snap
 /minigdb.snap.tmp
 /.minigdb_history
-.DS_Store
+
+# Named graph data directories created by the server / REPL
+/graphs/
+
+# RocksDB directories that may be created at the project root during testing
+/minigdb_*/
+
+# Python build artifacts (maturin / setuptools)
+*.so
+*.pyd
+/dist/
+/wheels/
+/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Internal project files not for public repo
+issues.md
+completed.md
+
+# Claude Code session data
 .claude/

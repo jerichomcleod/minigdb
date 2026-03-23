@@ -10,6 +10,7 @@
 //! | Method   | Path                  | Description                                         |
 //! |----------|-----------------------|-----------------------------------------------------|
 //! | `GET`    | `/`                   | Serves the embedded single-page HTML application.   |
+//! | `GET`    | `/assets/*`           | Serves embedded static assets (logo, etc.).         |
 //! | `GET`    | `/api/info`           | Returns `{"auth_required": bool}`.                  |
 //! | `POST`   | `/api/auth`           | Exchanges `{user, password}` for a bearer token.    |
 //! | `GET`    | `/api/graphs`         | Lists all open graph names.                         |
@@ -55,8 +56,8 @@ use std::time::Instant;
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Json},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{Html, IntoResponse, Json, Response},
     routing::{delete, get, post},
     Router,
 };
@@ -178,6 +179,7 @@ pub async fn serve(
     };
     let app = Router::new()
         .route("/", get(serve_html))
+        .route("/assets/minigdb_logo.webp", get(serve_logo))
         .route("/api/info", get(api_info))
         .route("/api/auth", post(api_auth))
         .route("/api/graphs", get(api_graphs).post(api_create_graph))
@@ -202,10 +204,21 @@ pub async fn serve(
 /// Embedding avoids any runtime file-system dependency: the binary is
 /// self-contained and can be deployed as a single executable.
 static HTML: &str = include_str!("static/gui.html");
+static LOGO: &[u8] = include_bytes!("static/assets/minigdb_logo.webp");
 
 /// Serve the embedded GUI HTML for `GET /`.
 async fn serve_html() -> Html<&'static str> {
     Html(HTML)
+}
+
+/// Serve the embedded logo for `GET /assets/minigdb_logo.webp`.
+async fn serve_logo() -> Response {
+    let mut res = Response::new(axum::body::Body::from(LOGO));
+    res.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("image/webp"),
+    );
+    res
 }
 
 // ── /api/info ─────────────────────────────────────────────────────────────────

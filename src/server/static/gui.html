@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><title>minigdb</title>
+<link rel="icon" type="image/webp" href="/assets/minigdb_logo.webp">
 <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.29.2/dist/cytoscape.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
@@ -147,7 +148,8 @@ tr:hover td{background:#161b22}
 </div>
 
 <div id="hdr">
-  <h1>⬡ minigdb</h1>
+  <img src="/assets/minigdb_logo.webp" alt="minigdb" style="height:24px;width:24px;object-fit:contain">
+  <h1>minigdb</h1>
   <select id="gsel" onchange="switchGraph(this.value)" title="Active graph"></select>
   <button onclick="newGraph()">+ Graph</button>
   <button onclick="dropGraph()" class="danger">✕ Drop</button>

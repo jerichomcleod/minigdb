@@ -2,9 +2,9 @@
 
 [![Crates.io](https://img.shields.io/crates/v/minigdb)](https://crates.io/crates/minigdb)
 [![docs.rs](https://img.shields.io/docsrs/minigdb)](https://docs.rs/minigdb)
-[![License: LGPL v3](https://img.shields.io/badge/License-LGPL_v3-blue.svg)](LICENSE)
+[![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
 
-An embedded property-graph database built from scratch in Rust. Property graph model (nodes and edges with labels and key-value properties), ACID-compliant RocksDB-backed storage, and a GQL (ISO/IEC 39075) query language subset — usable as a REPL, a network server, or an embedded Rust/Python library.
+An embedded property-graph database built in Rust on RocksDB. Property graph model (nodes and edges with labels and key-value properties), ACID-compliant RocksDB-backed storage, and a GQL (ISO/IEC 39075) query language subset — usable as a REPL, a network server, or an embedded Rust/Python library.
 
 **Feature highlights:**
 - GQL queries: `MATCH`, `INSERT`, `SET`, `DELETE`, variable-length paths, `OPTIONAL MATCH`, `UNION`, aggregates, `WITH`, `UNWIND`

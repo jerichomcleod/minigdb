@@ -108,7 +108,7 @@ fn py_to_value(py: Python<'_>, obj: &PyObject) -> Value {
         return Value::Float(f.value());
     }
     if let Ok(s) = bound.downcast::<PyString>() {
-        return Value::String(s.to_str().unwrap_or("").to_string());
+        return Value::String(s.extract::<String>().unwrap_or_default());
     }
     if let Ok(lst) = bound.downcast::<PyList>() {
         let items: Vec<Value> = lst.iter()
@@ -119,13 +119,13 @@ fn py_to_value(py: Python<'_>, obj: &PyObject) -> Value {
     if let Ok(d) = bound.downcast::<PyDict>() {
         let mut map = std::collections::HashMap::new();
         for (k, v) in d.iter() {
-            let key = k.str().map(|s| s.to_str().unwrap_or("").to_string()).unwrap_or_default();
+            let key = k.str().and_then(|s| s.extract::<String>()).unwrap_or_default();
             map.insert(key, py_to_value(py, &v.into_py(py)));
         }
         return Value::Map(map);
     }
     // Fallback: string representation.
-    Value::String(obj.bind(py).str().map(|s| s.to_str().unwrap_or("").to_string()).unwrap_or_default())
+    Value::String(obj.bind(py).str().and_then(|s| s.extract::<String>()).unwrap_or_default())
 }
 
 // ── DbError → PyErr ───────────────────────────────────────────────────────────
@@ -265,7 +265,7 @@ impl MiniGdb {
         let rust_params: HashMap<String, Value> = params
             .iter()
             .filter_map(|(k, v)| {
-                let key = k.str().ok()?.to_str().ok()?.to_string();
+                let key = k.str().ok()?.extract::<String>().ok()?;
                 Some((key, py_to_value(py, &v.into_py(py))))
             })
             .collect();

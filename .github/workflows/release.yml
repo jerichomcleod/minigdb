@@ -7,6 +7,9 @@ on:
       - "v*"
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   # ── Build wheels for all supported platforms ─────────────────────────────
   build-wheels:
@@ -16,7 +19,7 @@ jobs:
       matrix:
         include:
           # Linux x86_64 — quay.io/pypa/manylinux_2_28_x86_64 (AlmaLinux 8).
-          # zstd removed from rocksdb features → no zstd-sys → no bindgen → no libclang needed.
+          # librocksdb-sys needs libclang for bindgen; see before-script-linux below.
           - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64
@@ -80,6 +83,17 @@ jobs:
           args: --release --out dist --features python
           manylinux: ${{ matrix.manylinux }}
           container: ${{ matrix.maturin-container }}
+          # librocksdb-sys uses bindgen which requires libclang.
+          # On AlmaLinux 8 (manylinux_2_28), clang installs libclang.so into a
+          # versioned subdirectory (/usr/lib64/llvmN/lib/) that bindgen won't scan.
+          # We install clang+clang-devel then symlink the library into /usr/lib64/
+          # so bindgen finds it.  before-script-linux is ignored on macOS/Windows.
+          before-script-linux: |
+            yum install -y clang clang-devel
+            LIBCLANG=$(find /usr/lib64 /usr/lib -name 'libclang.so*' -type f 2>/dev/null | sort | head -1)
+            if [ -n "$LIBCLANG" ]; then
+              ln -sf "$LIBCLANG" /usr/lib64/libclang.so
+            fi
         env:
           # Suppress PyO3 max-version check on Windows (no Docker, env is forwarded).
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"

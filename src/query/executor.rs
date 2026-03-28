@@ -1288,8 +1288,7 @@ fn extend_steps(
                 }
             }
 
-            // Edge property constraints require loading the full edge from RocksDB.
-            // This is uncommon; most patterns filter only on label.
+            // Edge property constraints — load full edge (O(1) in-memory, ARCH-2).
             if !step.edge.properties.is_empty() {
                 let edge = match graph.get_edge(edge_id) { Some(e) => e, None => continue };
                 if !check_property_constraints(&step.edge.properties, &edge.properties) {
@@ -2576,6 +2575,49 @@ fn collect_where_index_candidates(
     }
 }
 
+/// Collect candidate EdgeId sets from declared edge property indexes for
+/// predicates in `where_expr` that reference edge variable `var` with `label`.
+/// Works identically to `collect_where_index_candidates` but operates on
+/// `graph.edge_prop_index` instead of `graph.prop_index`.
+fn collect_where_edge_index_candidates(
+    graph: &Graph,
+    label: &str,
+    var: &str,
+    where_expr: &Expr,
+    out: &mut Vec<Vec<EdgeId>>,
+) {
+    for idx_def in &graph.index_defs {
+        if idx_def.label != label {
+            continue;
+        }
+        if idx_def.target != crate::graph::IndexTarget::Edge {
+            continue;
+        }
+        let prop = &idx_def.property;
+
+        if let Some(eq_val) = extract_where_equality(where_expr, var, prop) {
+            if let Some(ids) = graph.lookup_by_edge_property(label, prop, eq_val) {
+                out.push(ids);
+                continue;
+            }
+        }
+
+        let (lo, hi) = extract_prop_range(where_expr, var, prop);
+        if lo.is_some() || hi.is_some() {
+            if let Some(ids) = graph.lookup_by_edge_property_range(label, prop, lo, hi) {
+                out.push(ids);
+                continue;
+            }
+        }
+
+        if let Some(prefix) = extract_starts_with(where_expr, var, prop) {
+            if let Some(ids) = graph.lookup_by_edge_property_prefix(label, prop, prefix) {
+                out.push(ids);
+            }
+        }
+    }
+}
+
 /// Extract the literal value from an equality predicate `var.prop = literal`
 /// (or `literal = var.prop`) anywhere in the expression tree (through AND).
 /// Returns `None` if no such predicate is found for this `(var, prop)` pair.
@@ -2979,8 +3021,19 @@ fn execute_create_index(
     graph: &mut Graph,
     next_txn_id: &mut u64,
 ) -> Result<(Vec<Row>, Vec<Operation>), DbError> {
-    let already = graph.has_property_index(&ci.label, &ci.property);
-    graph.apply_create_index(&ci.label, &ci.property);
+    // Determine target: check if label is known as edge label first, then node.
+    // If only one side has the label, use that. If both or neither, default to node.
+    let is_node_label = graph.label_index.contains_key(&ci.label);
+    let is_edge_label = graph.edge_label_index.contains_key(&ci.label);
+    let (already, op) = if is_edge_label && !is_node_label {
+        let already = graph.has_edge_property_index(&ci.label, &ci.property);
+        graph.create_edge_property_index(&ci.label, &ci.property);
+        (already, Operation::CreateIndex { label: ci.label.clone(), property: ci.property.clone() })
+    } else {
+        let already = graph.has_property_index(&ci.label, &ci.property);
+        graph.apply_create_index(&ci.label, &ci.property);
+        (already, Operation::CreateIndex { label: ci.label.clone(), property: ci.property.clone() })
+    };
     let txn_id = *next_txn_id;
     *next_txn_id += 1;
     let msg = if already {
@@ -2988,20 +3041,22 @@ fn execute_create_index(
     } else {
         format!("Index created ON :{}({}) [txn {txn_id}]", ci.label, ci.property)
     };
-    let op = Operation::CreateIndex { label: ci.label, property: ci.property };
     Ok((vec![summary_row(msg)], vec![op]))
 }
 
 /// Execute a `DROP INDEX ON :Label(property)` statement.
-///
-/// If the index did not exist, returns a summary saying so without emitting an
-/// operation.  Otherwise removes it and emits a `DropIndex` operation for WAL.
 fn execute_drop_index(
     di: DropIndexStatement,
     graph: &mut Graph,
     next_txn_id: &mut u64,
 ) -> Result<(Vec<Row>, Vec<Operation>), DbError> {
-    let existed = graph.drop_property_index(&di.label, &di.property);
+    let existed_node = graph.drop_property_index(&di.label, &di.property);
+    let existed_edge = if !existed_node {
+        graph.drop_edge_property_index(&di.label, &di.property)
+    } else {
+        false
+    };
+    let existed = existed_node || existed_edge;
     let txn_id = *next_txn_id;
     *next_txn_id += 1;
     let msg = if existed {
@@ -3016,8 +3071,7 @@ fn execute_drop_index(
 /// Execute a `SHOW INDEXES` statement.
 ///
 /// Returns one row per defined property index with columns `label`, `property`,
-/// and `entries` (number of distinct indexed values).  Returns a single summary
-/// row if no indexes are defined.
+/// `target` (node/edge), and `entries`.
 fn execute_show_indexes(graph: &Graph) -> Result<Vec<Row>, DbError> {
     let indexes = graph.list_property_indexes();
     if indexes.is_empty() {
@@ -3025,10 +3079,11 @@ fn execute_show_indexes(graph: &Graph) -> Result<Vec<Row>, DbError> {
     }
     Ok(indexes
         .into_iter()
-        .map(|(label, property, count)| {
+        .map(|(label, property, count, target)| {
             let mut row = Row::new();
             row.insert("label".to_string(), Value::String(label));
             row.insert("property".to_string(), Value::String(property));
+            row.insert("target".to_string(), Value::String(target));
             row.insert("entries".to_string(), Value::Int(count as i64));
             row
         })

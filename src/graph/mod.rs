@@ -1,37 +1,25 @@
-//! [`Graph`] — the in-memory/RocksDB property graph and its full read/write API.
+//! [`Graph`] — the fully in-memory property graph with RocksDB write-through.
 //!
-//! All graph mutations go through the `apply_*` family of methods, which either
-//! write directly to RocksDB (auto-commit mode) or buffer an [`Operation`] for
-//! deferred commit (explicit-transaction mode).  Secondary column families
-//! (`label_idx`, `adj_out`, `adj_in`, `prop_idx`, `edge_label_idx`) are
-//! maintained atomically in the same [`rocksdb::WriteBatch`] as the primary
-//! record, so the graph is always consistent even after a crash.
+//! ARCH-2: All nodes, edges, label indexes, and property indexes live in RAM.
+//! RocksDB is a pure write-through persistence layer — every mutation is applied
+//! in-memory first, then written to RocksDB atomically.  On `open()`, the entire
+//! graph is loaded from RocksDB into RAM once; thereafter no query ever reads
+//! from RocksDB.  This eliminates all steady-state RocksDB reads and makes every
+//! graph traversal/lookup a pure in-memory operation.
 
 pub(crate) mod ops;
 pub mod constraints;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use crate::storage::rocks_store::RocksStore;
 use crate::transaction::operation::Operation;
 use crate::types::{ulid_new, DbError, Edge, EdgeId, Node, NodeId, Value};
-
-// ── Property cache type alias ─────────────────────────────────────────────────
-
-/// Concurrent LRU cache for deserialized `Node` objects (PERF-6).
-///
-/// `moka::sync::Cache` is thread-safe without external locking, making it safe
-/// to read from Rayon parallel projection threads (PERF-12).  The cache stores
-/// `Arc<Node>` so cloning a cached value is cheap (ref-count bump only).
-///
-/// Capacity: 100 K nodes — enough to keep hub nodes warm across queries on
-/// typical graphs.  Entries are invalidated at `COMMIT` time (not at write-
-/// buffer time) to preserve correct read-your-own-writes semantics.
-type NodeCache = moka::sync::Cache<NodeId, Arc<Node>>;
 
 // ── In-memory adjacency ───────────────────────────────────────────────────────
 
@@ -64,11 +52,21 @@ pub(crate) enum AdjDelta {
     RemoveIn  { to:   NodeId, entry: AdjEntry },
 }
 
-/// A declared property index: index all nodes with `label` on the value of `property`.
+/// Which graph element a property index targets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum IndexTarget {
+    #[default]
+    Node,
+    Edge,
+}
+
+/// A declared property index: index all nodes (or edges) with `label` on the value of `property`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PropertyIndexDef {
     pub label: String,
     pub property: String,
+    #[serde(default)]
+    pub target: IndexTarget,
 }
 
 // ── Temp-dir cleanup helper ──────────────────────────────────────────────────
@@ -94,59 +92,70 @@ impl Drop for CleanupDir {
 ///
 /// **Field drop order matters**: `store` must be declared *before* `_owned_dir`
 /// so that RocksDB is closed before the temp directory is deleted.
-/// Pre-transaction snapshot used for rollback.
+/// Pre-transaction snapshot used for rollback (ARCH-2).
 ///
-/// Captured at `BEGIN`.  All writes during the transaction go directly to
-/// RocksDB so reads always see the latest state ("read your own writes").
-/// On `ROLLBACK`, the graph's RocksDB data is wiped and rebuilt from this
-/// snapshot.  On `COMMIT`, the snapshot is simply discarded.
+/// Captured at `BEGIN` by cloning the in-memory maps.  On `ROLLBACK`, the
+/// in-memory state is restored from this snapshot in O(1) pointer swaps, then
+/// RocksDB is cleared and rewritten from the restored maps.
 struct TransactionSnapshot {
-    nodes: Vec<crate::types::Node>,
-    edges: Vec<crate::types::Edge>,
-    index_defs: Vec<PropertyIndexDef>,
-    constraint_defs: Vec<constraints::ConstraintDef>,
-    prop_index_counts: HashMap<(String, String), usize>,
+    nodes:             HashMap<NodeId, Node>,
+    edges:             HashMap<EdgeId, Edge>,
+    label_index:       HashMap<String, HashSet<NodeId>>,
+    edge_label_index:  HashMap<String, HashSet<EdgeId>>,
+    prop_index:        HashMap<(String, String), BTreeMap<String, HashSet<NodeId>>>,
+    edge_prop_index:   HashMap<(String, String), BTreeMap<String, HashSet<EdgeId>>>,
+    index_defs:        Vec<PropertyIndexDef>,
+    constraint_defs:   Vec<constraints::ConstraintDef>,
 }
 
 pub struct Graph {
-    /// RocksDB-backed store — the single source of truth.
+    /// RocksDB-backed store — write-through persistence only (ARCH-2).
+    /// Reads during query execution never touch RocksDB; all data lives in RAM.
     /// MUST be declared first so it drops before `_owned_dir`.
     pub(crate) store: RocksStore,
+
+    // ── Primary in-memory stores (ARCH-2) ─────────────────────────────────────
+    //
+    // Source of truth for all reads after open().  RocksDB is written
+    // atomically on every mutation for durability; startup loads these maps
+    // from RocksDB once.
+
+    /// All nodes, keyed by NodeId.
+    pub(crate) nodes: HashMap<NodeId, Node>,
+    /// All edges, keyed by EdgeId.
+    pub(crate) edges: HashMap<EdgeId, Edge>,
+
+    // ── Secondary in-memory indexes ───────────────────────────────────────────
+
+    /// Maps label → set of NodeIds with that label.
+    pub(crate) label_index: HashMap<String, HashSet<NodeId>>,
+    /// Maps edge label → set of EdgeIds with that label.
+    pub(crate) edge_label_index: HashMap<String, HashSet<EdgeId>>,
+
+    // ── Property indexes ──────────────────────────────────────────────────────
+    //
+    // Populated only for labels/properties with a `CREATE INDEX` definition.
+    // BTreeMap on encoded value enables equality, range, and prefix lookups in
+    // O(log n + matches) with zero RocksDB involvement.
+
+    /// Node property index: (label, property) → encoded_value → NodeId set.
+    pub(crate) prop_index: HashMap<(String, String), BTreeMap<String, HashSet<NodeId>>>,
+    /// Edge property index: (label, property) → encoded_value → EdgeId set.
+    pub(crate) edge_prop_index: HashMap<(String, String), BTreeMap<String, HashSet<EdgeId>>>,
+
+    // ── Metadata ──────────────────────────────────────────────────────────────
+
     /// Declared property index definitions (persisted to meta CF).
     pub(crate) index_defs: Vec<PropertyIndexDef>,
-    /// In-memory cache of property index entry counts.
-    ///
-    /// Maintained alongside every `put_prop_entry` / `delete_prop_entry` call so
-    /// that `SHOW INDEXES` is a pure in-memory scan rather than N RocksDB reads.
-    /// Also eliminates the synchronous read inside `adjust_prop_count_batch` on
-    /// every node insert/update/delete.  Loaded from the meta CF on `open()`.
-    pub(crate) prop_index_counts: HashMap<(String, String), usize>,
     /// Declared constraints (persisted to meta CF under key `constraint_defs`).
-    ///
-    /// Each [`ConstraintDef`](constraints::ConstraintDef) records a `(kind, label,
-    /// property)` triple.  Enforcement is performed inside every `insert_node` and
-    /// `set_node_property` call via [`ops::check_constraints`].  The list is loaded
-    /// from RocksDB on `open()` and updated atomically (save to meta CF) on every
-    /// `add_constraint` / `remove_constraint` call.
     pub(crate) constraint_defs: Vec<constraints::ConstraintDef>,
     /// Marker for an active explicit transaction.
-    /// `None` = auto-commit mode; `Some(_)` = inside BEGIN…COMMIT.
-    /// Writes always go to RocksDB immediately; this field only tracks the
-    /// transaction boundary so that `commit` / `rollback` can be validated.
     txn_pending_ops: Option<Vec<Operation>>,
     /// Pre-BEGIN snapshot, used to restore state on ROLLBACK.
     txn_snapshot: Option<Box<TransactionSnapshot>>,
     /// Transient mapping from user-supplied CSV `:ID` strings to their assigned
     /// [`NodeId`]s.  Populated by `LOAD CSV NODES`; consumed by `LOAD CSV EDGES`.
-    /// Not persisted to disk.  Cleared by [`Graph::clear_csv_id_map`].
     pub csv_id_map: HashMap<String, NodeId>,
-
-    // ── Property cache (PERF-6) ───────────────────────────────────────────────
-    //
-    // Concurrent LRU cache for deserialized Node objects.  Avoids repeated
-    // bincode::deserialize calls for hot hub nodes accessed across many queries.
-    // Invalidated at COMMIT time to preserve read-your-own-writes correctness.
-    node_cache: NodeCache,
 
     // ── In-memory adjacency (ARCH-1) ──────────────────────────────────────────
     //
@@ -199,13 +208,17 @@ impl Graph {
         let _ = store.put_meta(crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT, b"1");
         Self {
             store,
+            nodes: HashMap::new(),
+            edges: HashMap::new(),
+            label_index: HashMap::new(),
+            edge_label_index: HashMap::new(),
+            prop_index: HashMap::new(),
+            edge_prop_index: HashMap::new(),
             index_defs: Vec::new(),
-            prop_index_counts: HashMap::new(),
             constraint_defs: Vec::new(),
             txn_pending_ops: None,
             txn_snapshot: None,
             csv_id_map: HashMap::new(),
-            node_cache: moka::sync::Cache::new(100_000),
             adj_out: HashMap::new(),
             adj_in:  HashMap::new(),
             adj_label_to_id: HashMap::new(),
@@ -217,20 +230,26 @@ impl Graph {
     }
 
     /// Open (or create) a persistent graph at `path`.
-    /// Called by `StorageManager::open`.
+    ///
+    /// Performs a full load of all nodes, edges, and indexes from RocksDB into
+    /// RAM (ARCH-2).  After `open()` returns, all reads are pure in-memory.
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let store = RocksStore::open(path)?;
         let index_defs = ops::load_index_defs(&store)?;
         let constraint_defs = ops::load_constraints(&store)?;
         let mut graph = Self {
             store,
+            nodes: HashMap::new(),
+            edges: HashMap::new(),
+            label_index: HashMap::new(),
+            edge_label_index: HashMap::new(),
+            prop_index: HashMap::new(),
+            edge_prop_index: HashMap::new(),
             index_defs,
-            prop_index_counts: HashMap::new(),
             constraint_defs,
             txn_pending_ops: None,
             txn_snapshot: None,
             csv_id_map: HashMap::new(),
-            node_cache: moka::sync::Cache::new(100_000),
             adj_out: HashMap::new(),
             adj_in:  HashMap::new(),
             adj_label_to_id: HashMap::new(),
@@ -239,23 +258,84 @@ impl Graph {
             suppress_adj: false,
             _owned_dir: None,
         };
-        // Migration R6: populate edge_label_idx CF for existing databases that
-        // pre-date this index. The meta key is written once after the rebuild.
-        if graph.store.get_meta(crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT)?.is_none() {
-            ops::rebuild_edge_label_idx(&mut graph)?;
+
+        // ── Pass 1: load all nodes + build label_index ────────────────────────
+        let raw_nodes = graph.store.all_nodes_raw()?;
+        for data in raw_nodes {
+            if let Ok(node) = bincode::deserialize::<Node>(&data) {
+                for label in &node.labels {
+                    graph.label_index
+                        .entry(label.clone())
+                        .or_default()
+                        .insert(node.id);
+                }
+                graph.nodes.insert(node.id, node);
+            }
         }
-        // Build in-memory adjacency list from RocksDB adj_out CF.
-        // For large graphs this takes a few seconds; all subsequent traversal
-        // is ns-per-hop instead of μs-per-hop.
+
+        // ── Pass 2: build prop_index from in-memory nodes ─────────────────────
+        for def in &graph.index_defs {
+            if def.target == IndexTarget::Node {
+                graph.prop_index
+                    .entry((def.label.clone(), def.property.clone()))
+                    .or_default();
+            }
+        }
+        for (_, node) in &graph.nodes {
+            for label in &node.labels {
+                for (prop, val) in &node.properties {
+                    let key = (label.clone(), prop.clone());
+                    if let Some(btree) = graph.prop_index.get_mut(&key) {
+                        if let Some(encoded) = crate::types::value_index_key(val) {
+                            btree.entry(encoded).or_default().insert(node.id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Pass 3: load all edges + build edge_label_index ──────────────────
+        let raw_edges = graph.store.all_edges_raw()?;
+        for data in raw_edges {
+            if let Ok(edge) = bincode::deserialize::<Edge>(&data) {
+                graph.edge_label_index
+                    .entry(edge.label.clone())
+                    .or_default()
+                    .insert(edge.id);
+                graph.edges.insert(edge.id, edge);
+            }
+        }
+
+        // ── Pass 4: build edge_prop_index from in-memory edges ────────────────
+        for def in &graph.index_defs {
+            if def.target == IndexTarget::Edge {
+                graph.edge_prop_index
+                    .entry((def.label.clone(), def.property.clone()))
+                    .or_default();
+            }
+        }
+        for (_, edge) in &graph.edges {
+            let key = (edge.label.clone(),);  // single label per edge
+            for (prop, val) in &edge.properties {
+                let k = (edge.label.clone(), prop.clone());
+                if let Some(btree) = graph.edge_prop_index.get_mut(&k) {
+                    if let Some(encoded) = crate::types::value_index_key(val) {
+                        btree.entry(encoded).or_default().insert(edge.id);
+                    }
+                }
+            }
+            let _ = key;
+        }
+
+        // ── Pass 5: build adj_out / adj_in from in-memory edges ───────────────
         graph.build_adj()?;
-        // Load prop index counts into memory so SHOW INDEXES is a pure in-memory scan.
-        let idx_keys: Vec<(String, String)> = graph.index_defs.iter()
-            .map(|d| (d.label.clone(), d.property.clone()))
-            .collect();
-        for (label, property) in idx_keys {
-            let count = graph.store.get_prop_count(&label, &property);
-            graph.prop_index_counts.insert((label, property), count);
+
+        // Migration R6: populate edge_label_idx CF for existing databases that
+        // pre-date this index. Needed for durability only; queries use in-memory.
+        if graph.store.get_meta(crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT)?.is_none() {
+            ops::rebuild_edge_label_idx_from_memory(&mut graph)?;
         }
+
         Ok(graph)
     }
 
@@ -271,126 +351,74 @@ impl Graph {
 
     // ── Read API ─────────────────────────────────────────────────────────────
 
+    /// Look up a node by ID — O(1) in-memory HashMap lookup (ARCH-2).
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
-        // Fast path: serve from the concurrent node cache (PERF-6).
-        // The cache stores Arc<Node> so cloning is a ref-count bump only.
-        if let Some(cached) = self.node_cache.get(&id) {
-            return Some((*cached).clone());
-        }
-        // Slow path: load from RocksDB and populate the cache.
-        let node = self.store
-            .get_node_raw(id.0)
-            .ok()
-            .flatten()
-            .and_then(|data| bincode::deserialize::<Node>(&data).ok())?;
-        self.node_cache.insert(id, Arc::new(node.clone()));
-        Some(node)
+        self.nodes.get(&id).cloned()
     }
 
-    /// Invalidate the cache entry for `id`.
-    ///
-    /// Called on COMMIT (not at write-buffer time) so that reads within an
-    /// active transaction always see the latest written value without stale
-    /// cached data interfering.
-    pub(crate) fn node_cache_invalidate(&self, id: NodeId) {
-        self.node_cache.invalidate(&id);
-    }
-
-    /// Invalidate the entire node cache — used on ROLLBACK.
-    pub(crate) fn node_cache_invalidate_all(&self) {
-        self.node_cache.invalidate_all();
-    }
-
+    /// Look up an edge by ID — O(1) in-memory HashMap lookup (ARCH-2).
     pub fn get_edge(&self, id: EdgeId) -> Option<Edge> {
-        self.store
-            .get_edge_raw(id.0)
-            .ok()
-            .flatten()
-            .and_then(|data| bincode::deserialize(&data).ok())
+        self.edges.get(&id).cloned()
     }
 
+    /// Number of nodes — O(1) (ARCH-2).
     pub fn node_count(&self) -> usize {
-        self.store.node_count().unwrap_or(0) as usize
+        self.nodes.len()
     }
 
-    /// Return the number of nodes carrying `label` — O(1) meta CF lookup.
-    ///
-    /// Used by the query planner (PERF-10) to order disconnected MATCH patterns
-    /// by ascending cardinality.  Returns 0 for labels that existed before the
-    /// counter was introduced; the counter is lazily initialized on the next
-    /// write to that label.
+    /// Number of nodes with `label` — O(1) in-memory set size (ARCH-2).
     pub fn count_nodes_with_label(&self, label: &str) -> usize {
-        self.store.get_label_count(label)
+        self.label_index.get(label).map_or(0, |s| s.len())
     }
 
+    /// Number of edges — O(1) (ARCH-2).
     pub fn edge_count(&self) -> usize {
-        self.store.edge_count().unwrap_or(0) as usize
+        self.edges.len()
     }
 
+    /// All NodeIds with `label` — O(1) HashSet clone (ARCH-2).
     pub fn nodes_by_label(&self, label: &str) -> Vec<NodeId> {
-        self.store
-            .scan_label(label)
+        self.label_index
+            .get(label)
+            .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
-            .into_iter()
-            .map(NodeId)
-            .collect()
     }
 
-    /// Like `nodes_by_label` but stops after `limit` IDs — avoids a full scan
-    /// when LIMIT is known and no ORDER BY / WHERE is present.
+    /// Up to `limit` NodeIds with `label` (ARCH-2).
     pub fn nodes_by_label_limit(&self, label: &str, limit: usize) -> Vec<NodeId> {
-        self.store
-            .scan_label_limit(label, limit)
+        self.label_index
+            .get(label)
+            .map(|s| s.iter().cloned().take(limit).collect())
             .unwrap_or_default()
-            .into_iter()
-            .map(NodeId)
-            .collect()
     }
 
-    /// Return the first `limit` node IDs from the store without a full scan.
+    /// First `limit` node IDs — O(limit) in-memory (ARCH-2).
     pub fn first_n_node_ids(&self, limit: usize) -> Vec<NodeId> {
-        self.store
-            .all_node_ids_limit(limit)
-            .unwrap_or_default()
-            .into_iter()
-            .map(NodeId)
-            .collect()
+        self.nodes.keys().cloned().take(limit).collect()
     }
 
-    /// All edges with a given label (O(matches) via `edge_label_idx` CF).
+    /// All EdgeIds with `label` — O(1) HashSet clone (ARCH-2).
     pub fn edges_by_label(&self, label: &str) -> Vec<EdgeId> {
-        self.store
-            .scan_edge_label(label)
+        self.edge_label_index
+            .get(label)
+            .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
-            .into_iter()
-            .map(EdgeId)
-            .collect()
     }
 
+    /// All outgoing edges for `node_id` — O(degree) in-memory adj list (ARCH-2).
     pub fn outgoing_edges(&self, node_id: NodeId) -> Vec<EdgeId> {
-        if let Some(entries) = self.adj_out.get(&node_id) {
-            entries.iter().map(|e| e.edge_id).collect()
-        } else {
-            self.store
-                .scan_adj_out(node_id.0)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eid, _, _)| EdgeId(eid))
-                .collect()
-        }
+        self.adj_out
+            .get(&node_id)
+            .map(|v| v.iter().map(|e| e.edge_id).collect())
+            .unwrap_or_default()
     }
 
+    /// All incoming edges for `node_id` — O(degree) in-memory adj list (ARCH-2).
     pub fn incoming_edges(&self, node_id: NodeId) -> Vec<EdgeId> {
-        if let Some(entries) = self.adj_in.get(&node_id) {
-            entries.iter().map(|e| e.edge_id).collect()
-        } else {
-            self.store
-                .scan_adj_in(node_id.0)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eid, _, _)| EdgeId(eid))
-                .collect()
-        }
+        self.adj_in
+            .get(&node_id)
+            .map(|v| v.iter().map(|e| e.edge_id).collect())
+            .unwrap_or_default()
     }
 
     // ── In-memory adjacency API (ARCH-1) ──────────────────────────────────────
@@ -496,113 +524,106 @@ impl Graph {
         }
     }
 
-    /// Populate `adj_out` and `adj_in` from the RocksDB `adj_out` CF.
+    /// Build `adj_out` and `adj_in` from the in-memory `edges` map (ARCH-2).
     ///
-    /// Called once in `Graph::open()`.  For large graphs (40 M+ edges) this
-    /// takes a few seconds on first open after ARCH-1 is deployed; all
-    /// subsequent traversal is ns-per-hop rather than μs-per-hop.
-    ///
-    /// For new (empty) graphs this is a no-op.
+    /// Called once in `Graph::open()` after all edges are loaded.  All
+    /// subsequent adjacency mutations are write-through.
     pub(crate) fn build_adj(&mut self) -> Result<(), DbError> {
-        let all_entries = self.store.iter_all_adj_out()?;
-        if all_entries.is_empty() {
+        if self.edges.is_empty() {
             return Ok(());
         }
+        let n = self.edges.len();
+        let node_count = self.nodes.len().max(1);
+        let avg_degree = (n / node_count).max(1);
 
-        // Pre-size: use average out-degree to reduce Vec reallocation.
-        let approx_node_count = self.store.node_count().unwrap_or(1).max(1) as usize;
-        let avg_degree = (all_entries.len() / approx_node_count).max(1);
+        // Collect to avoid borrow-checker conflict between &self.edges and
+        // &mut self (needed for intern_adj_label).
+        let edge_data: Vec<(NodeId, NodeId, EdgeId, String, bool)> = self
+            .edges
+            .values()
+            .map(|e| (e.from_node, e.to_node, e.id, e.label.clone(), e.directed))
+            .collect();
 
-        eprintln!(
-            "minigdb: loading adjacency index ({} edges)...",
-            all_entries.len()
-        );
-
-        for (from, edge_id, to, label) in all_entries {
+        for (from, to, eid, label, directed) in edge_data {
             let label_id = self.intern_adj_label(&label);
-            let from_id = NodeId(from);
-            let to_id   = NodeId(to);
-            let eid     = EdgeId(edge_id);
-
             self.adj_out
-                .entry(from_id)
+                .entry(from)
                 .or_insert_with(|| Vec::with_capacity(avg_degree))
-                .push(AdjEntry { edge_id: eid, neighbor: to_id, label_id });
+                .push(AdjEntry { edge_id: eid, neighbor: to, label_id });
             self.adj_in
-                .entry(to_id)
+                .entry(to)
                 .or_insert_with(|| Vec::with_capacity(avg_degree))
-                .push(AdjEntry { edge_id: eid, neighbor: from_id, label_id });
+                .push(AdjEntry { edge_id: eid, neighbor: from, label_id });
+            if !directed {
+                let lid2 = label_id;
+                self.adj_out
+                    .entry(to)
+                    .or_insert_with(|| Vec::with_capacity(avg_degree))
+                    .push(AdjEntry { edge_id: eid, neighbor: from, label_id: lid2 });
+                self.adj_in
+                    .entry(from)
+                    .or_insert_with(|| Vec::with_capacity(avg_degree))
+                    .push(AdjEntry { edge_id: eid, neighbor: to, label_id: lid2 });
+            }
         }
-
-        eprintln!("minigdb: adjacency index ready.");
         Ok(())
     }
 
+    /// All nodes — O(N) clone from in-memory map (ARCH-2).
     pub fn all_nodes(&self) -> Vec<Node> {
-        self.store
-            .all_node_ids()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|id| {
-                self.store
-                    .get_node_raw(id)
-                    .ok()
-                    .flatten()
-                    .and_then(|data| bincode::deserialize(&data).ok())
-            })
-            .collect()
+        self.nodes.values().cloned().collect()
     }
 
+    /// All edges — O(E) clone from in-memory map (ARCH-2).
     pub fn all_edges(&self) -> Vec<Edge> {
-        self.store
-            .all_edge_ids()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|id| {
-                self.store
-                    .get_edge_raw(id)
-                    .ok()
-                    .flatten()
-                    .and_then(|data| bincode::deserialize(&data).ok())
-            })
-            .collect()
+        self.edges.values().cloned().collect()
     }
 
     // ── Property index API ───────────────────────────────────────────────────
 
-    /// Declare a property index for (label, property).  Returns false if already exists.
-    /// Populates the `prop_idx` CF by scanning all nodes with `label`.
+    /// Declare a node property index for (label, property).  Returns false if already exists.
+    /// Backfills from the in-memory `nodes` map — no RocksDB scan needed (ARCH-2).
     pub fn create_property_index(&mut self, label: &str, property: &str) -> bool {
-        let def = PropertyIndexDef { label: label.to_string(), property: property.to_string() };
+        let def = PropertyIndexDef {
+            label: label.to_string(),
+            property: property.to_string(),
+            target: IndexTarget::Node,
+        };
         if self.index_defs.contains(&def) {
             return false;
         }
         self.index_defs.push(def);
         let _ = ops::save_index_defs(&self.store, &self.index_defs);
 
-        // Populate prop_idx CF for existing nodes.
-        let node_ids = self.store.scan_label(label).unwrap_or_default();
+        // Backfill in-memory prop_index and prop_idx CF from in-memory nodes.
+        let key = (label.to_string(), property.to_string());
+        let btree = self.prop_index.entry(key.clone()).or_default();
         let mut batch = crate::storage::rocks_store::RocksStore::batch();
-        let mut count = 0usize;
-        for nid in node_ids {
-            if let Some(node) = self.get_node(NodeId(nid)) {
+        let candidate_ids: Vec<NodeId> = self.label_index
+            .get(label)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        for nid in candidate_ids {
+            if let Some(node) = self.nodes.get(&nid) {
                 if let Some(val) = node.properties.get(property) {
                     if let Some(encoded) = crate::types::value_index_key(val) {
-                        self.store.put_prop_entry(&mut batch, label, property, &encoded, nid);
-                        count += 1;
+                        self.store.put_prop_entry(&mut batch, label, property, &encoded, nid.0);
+                        btree.entry(encoded).or_default().insert(nid);
                     }
                 }
             }
         }
-        self.store.set_prop_count_batch(&mut batch, label, property, count);
         let _ = self.store.write(batch);
-        self.prop_index_counts.insert((label.to_string(), property.to_string()), count);
         true
     }
 
-    /// Remove a property index for (label, property).  Returns false if not found.
+    /// Remove a node property index for (label, property).  Returns false if not found.
     pub fn drop_property_index(&mut self, label: &str, property: &str) -> bool {
-        let def = PropertyIndexDef { label: label.to_string(), property: property.to_string() };
+        let def = PropertyIndexDef {
+            label: label.to_string(),
+            property: property.to_string(),
+            target: IndexTarget::Node,
+        };
         let before = self.index_defs.len();
         self.index_defs.retain(|d| d != &def);
         if self.index_defs.len() == before {
@@ -610,26 +631,32 @@ impl Graph {
         }
         let _ = ops::save_index_defs(&self.store, &self.index_defs);
         let _ = self.store.delete_prop_range(label, property);
-        let _ = self.store.delete_prop_count(label, property);
-        self.prop_index_counts.remove(&(label.to_string(), property.to_string()));
+        self.prop_index.remove(&(label.to_string(), property.to_string()));
         true
     }
 
-    /// List all declared indexes with their entry counts (O(1) in-memory lookup).
-    pub fn list_property_indexes(&self) -> Vec<(String, String, usize)> {
+    /// List all declared indexes with their entry counts (ARCH-2 — from in-memory maps).
+    pub fn list_property_indexes(&self) -> Vec<(String, String, usize, String)> {
         self.index_defs
             .iter()
             .map(|def| {
-                let count = self.prop_index_counts
-                    .get(&(def.label.clone(), def.property.clone()))
-                    .copied()
-                    .unwrap_or(0);
-                (def.label.clone(), def.property.clone(), count)
+                let key = (def.label.clone(), def.property.clone());
+                let count = match def.target {
+                    IndexTarget::Node => self.prop_index.get(&key)
+                        .map_or(0, |bt| bt.values().map(|s| s.len()).sum()),
+                    IndexTarget::Edge => self.edge_prop_index.get(&key)
+                        .map_or(0, |bt| bt.values().map(|s| s.len()).sum()),
+                };
+                let target_str = match def.target {
+                    IndexTarget::Node => "node".to_string(),
+                    IndexTarget::Edge => "edge".to_string(),
+                };
+                (def.label.clone(), def.property.clone(), count, target_str)
             })
             .collect()
     }
 
-    /// Look up NodeIds by (label, property, value) using the `prop_idx` CF.
+    /// Look up NodeIds by (label, property, value) — pure in-memory BTreeMap (ARCH-2).
     /// Returns None if no index exists for (label, property).
     pub fn lookup_by_property(
         &self,
@@ -637,26 +664,12 @@ impl Graph {
         property: &str,
         value: &Value,
     ) -> Option<Vec<NodeId>> {
-        if !self.has_property_index(label, property) {
-            return None;
-        }
         let encoded = crate::types::value_index_key(value)?;
-        Some(
-            self.store
-                .scan_prop(label, property, &encoded)
-                .unwrap_or_default()
-                .into_iter()
-                .map(NodeId)
-                .collect(),
-        )
+        let btree = self.prop_index.get(&(label.to_string(), property.to_string()))?;
+        Some(btree.get(&encoded).map_or(Vec::new(), |s| s.iter().cloned().collect()))
     }
 
-    /// Lookup nodes whose `(label, property)` value falls within a range.
-    ///
-    /// `lo` / `hi` are optional `(value, inclusive)` bounds.  Values must be
-    /// `Int` or `Float` for the ordering to be meaningful; `String` values
-    /// compare lexicographically, which is also correct.
-    ///
+    /// Range lookup on node property index — BTreeMap::range (ARCH-2).
     /// Returns `None` if no index exists for `(label, property)`.
     pub fn lookup_by_property_range(
         &self,
@@ -665,30 +678,27 @@ impl Graph {
         lo: Option<(&Value, bool)>,
         hi: Option<(&Value, bool)>,
     ) -> Option<Vec<NodeId>> {
-        if !self.has_property_index(label, property) {
-            return None;
-        }
+        let btree = self.prop_index.get(&(label.to_string(), property.to_string()))?;
         let lo_enc = lo.and_then(|(v, incl)| crate::types::value_index_key(v).map(|k| (k, incl)));
         let hi_enc = hi.and_then(|(v, incl)| crate::types::value_index_key(v).map(|k| (k, incl)));
-
-        Some(
-            self.store
-                .scan_prop_range(
-                    label,
-                    property,
-                    lo_enc.as_ref().map(|(k, incl)| (k.as_str(), *incl)),
-                    hi_enc.as_ref().map(|(k, incl)| (k.as_str(), *incl)),
-                )
-                .unwrap_or_default()
-                .into_iter()
-                .map(NodeId)
-                .collect(),
-        )
+        let lo_bound = match &lo_enc {
+            None => Bound::Unbounded,
+            Some((k, true))  => Bound::Included(k.clone()),
+            Some((k, false)) => Bound::Excluded(k.clone()),
+        };
+        let hi_bound = match &hi_enc {
+            None => Bound::Unbounded,
+            Some((k, true))  => Bound::Included(k.clone()),
+            Some((k, false)) => Bound::Excluded(k.clone()),
+        };
+        let mut ids = Vec::new();
+        for (_k, set) in btree.range((lo_bound, hi_bound)) {
+            ids.extend(set.iter().cloned());
+        }
+        Some(ids)
     }
 
-    /// Look up nodes whose `(label, property)` string value starts with `prefix`.
-    ///
-    /// Uses the `prop_idx` CF prefix scan — O(log n + matches).
+    /// Prefix lookup on node property string index — BTreeMap scan (ARCH-2).
     /// Returns `None` if no index exists for `(label, property)`.
     pub fn lookup_by_property_prefix(
         &self,
@@ -696,22 +706,136 @@ impl Graph {
         property: &str,
         prefix: &str,
     ) -> Option<Vec<NodeId>> {
-        if !self.has_property_index(label, property) {
-            return None;
+        let btree = self.prop_index.get(&(label.to_string(), property.to_string()))?;
+        // String values in the prop index are encoded as "S:<original_value>".
+        let encoded_prefix = format!("S:{}", prefix);
+        let mut ids = Vec::new();
+        for (key, set) in btree.range(encoded_prefix.clone()..) {
+            if !key.starts_with(&encoded_prefix) { break; }
+            ids.extend(set.iter().cloned());
         }
-        Some(
-            self.store
-                .scan_prop_prefix(label, property, prefix)
-                .unwrap_or_default()
-                .into_iter()
-                .map(NodeId)
-                .collect(),
-        )
+        Some(ids)
     }
 
-    /// Returns true if a property index exists for (label, property).
+    /// Returns true if a node property index exists for (label, property).
     pub fn has_property_index(&self, label: &str, property: &str) -> bool {
-        self.index_defs.iter().any(|d| d.label == label && d.property == property)
+        self.prop_index.contains_key(&(label.to_string(), property.to_string()))
+    }
+
+    // ── Edge property index API ──────────────────────────────────────────────
+
+    /// Declare an edge property index for (label, property).  Returns false if already exists.
+    pub fn create_edge_property_index(&mut self, label: &str, property: &str) -> bool {
+        let def = PropertyIndexDef {
+            label: label.to_string(),
+            property: property.to_string(),
+            target: IndexTarget::Edge,
+        };
+        if self.index_defs.contains(&def) {
+            return false;
+        }
+        self.index_defs.push(def);
+        let _ = ops::save_index_defs(&self.store, &self.index_defs);
+
+        let key = (label.to_string(), property.to_string());
+        let btree = self.edge_prop_index.entry(key.clone()).or_default();
+        let mut batch = crate::storage::rocks_store::RocksStore::batch();
+        let candidate_ids: Vec<EdgeId> = self.edge_label_index
+            .get(label)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        for eid in candidate_ids {
+            if let Some(edge) = self.edges.get(&eid) {
+                if let Some(val) = edge.properties.get(property) {
+                    if let Some(encoded) = crate::types::value_index_key(val) {
+                        self.store.put_edge_prop_entry(&mut batch, label, property, &encoded, eid.0);
+                        btree.entry(encoded).or_default().insert(eid);
+                    }
+                }
+            }
+        }
+        let _ = self.store.write(batch);
+        true
+    }
+
+    /// Remove an edge property index.  Returns false if not found.
+    pub fn drop_edge_property_index(&mut self, label: &str, property: &str) -> bool {
+        let def = PropertyIndexDef {
+            label: label.to_string(),
+            property: property.to_string(),
+            target: IndexTarget::Edge,
+        };
+        let before = self.index_defs.len();
+        self.index_defs.retain(|d| d != &def);
+        if self.index_defs.len() == before {
+            return false;
+        }
+        let _ = ops::save_index_defs(&self.store, &self.index_defs);
+        let _ = self.store.delete_edge_prop_range(label, property);
+        self.edge_prop_index.remove(&(label.to_string(), property.to_string()));
+        true
+    }
+
+    /// Returns true if an edge property index exists for (label, property).
+    pub fn has_edge_property_index(&self, label: &str, property: &str) -> bool {
+        self.edge_prop_index.contains_key(&(label.to_string(), property.to_string()))
+    }
+
+    /// Look up EdgeIds by (label, property, value) — pure in-memory BTreeMap.
+    pub fn lookup_by_edge_property(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+    ) -> Option<Vec<EdgeId>> {
+        let encoded = crate::types::value_index_key(value)?;
+        let btree = self.edge_prop_index.get(&(label.to_string(), property.to_string()))?;
+        Some(btree.get(&encoded).map_or(Vec::new(), |s| s.iter().cloned().collect()))
+    }
+
+    /// Range lookup on edge property index.
+    pub fn lookup_by_edge_property_range(
+        &self,
+        label: &str,
+        property: &str,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+    ) -> Option<Vec<EdgeId>> {
+        let btree = self.edge_prop_index.get(&(label.to_string(), property.to_string()))?;
+        let lo_enc = lo.and_then(|(v, incl)| crate::types::value_index_key(v).map(|k| (k, incl)));
+        let hi_enc = hi.and_then(|(v, incl)| crate::types::value_index_key(v).map(|k| (k, incl)));
+        let lo_bound = match &lo_enc {
+            None => Bound::Unbounded,
+            Some((k, true))  => Bound::Included(k.clone()),
+            Some((k, false)) => Bound::Excluded(k.clone()),
+        };
+        let hi_bound = match &hi_enc {
+            None => Bound::Unbounded,
+            Some((k, true))  => Bound::Included(k.clone()),
+            Some((k, false)) => Bound::Excluded(k.clone()),
+        };
+        let mut ids = Vec::new();
+        for (_k, set) in btree.range((lo_bound, hi_bound)) {
+            ids.extend(set.iter().cloned());
+        }
+        Some(ids)
+    }
+
+    /// Prefix lookup on edge property string index.
+    pub fn lookup_by_edge_property_prefix(
+        &self,
+        label: &str,
+        property: &str,
+        prefix: &str,
+    ) -> Option<Vec<EdgeId>> {
+        let btree = self.edge_prop_index.get(&(label.to_string(), property.to_string()))?;
+        let encoded_prefix = format!("S:{}", prefix);
+        let mut ids = Vec::new();
+        for (key, set) in btree.range(encoded_prefix.clone()..) {
+            if !key.starts_with(&encoded_prefix) { break; }
+            ids.extend(set.iter().cloned());
+        }
+        Some(ids)
     }
 
     // ── Constraint API ───────────────────────────────────────────────────────
@@ -793,8 +917,18 @@ impl Graph {
             ));
         }
         self.store.clear_all()?;
+        // Clear all in-memory structures.
+        self.nodes.clear();
+        self.edges.clear();
+        self.label_index.clear();
+        self.edge_label_index.clear();
+        // Clear prop_index data but preserve declared index keys (structures remain).
+        for bt in self.prop_index.values_mut() { bt.clear(); }
+        for bt in self.edge_prop_index.values_mut() { bt.clear(); }
+        self.adj_out.clear();
+        self.adj_in.clear();
         self.csv_id_map.clear();
-        // Re-stamp the edge-label-index sentinel (empty DB; nothing to rebuild).
+        // Re-stamp the edge-label-index sentinel.
         let _ = self.store.put_meta(
             crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT,
             b"1",
@@ -814,11 +948,14 @@ impl Graph {
             return Err(DbError::Query("transaction already active".into()));
         }
         self.txn_snapshot = Some(Box::new(TransactionSnapshot {
-            nodes: self.all_nodes(),
-            edges: self.all_edges(),
-            index_defs: self.index_defs.clone(),
-            constraint_defs: self.constraint_defs.clone(),
-            prop_index_counts: self.prop_index_counts.clone(),
+            nodes:            self.nodes.clone(),
+            edges:            self.edges.clone(),
+            label_index:      self.label_index.clone(),
+            edge_label_index: self.edge_label_index.clone(),
+            prop_index:       self.prop_index.clone(),
+            edge_prop_index:  self.edge_prop_index.clone(),
+            index_defs:       self.index_defs.clone(),
+            constraint_defs:  self.constraint_defs.clone(),
         }));
         self.txn_pending_ops = Some(Vec::new());
         self.txn_adj_deltas = Some(Vec::new());
@@ -833,10 +970,6 @@ impl Graph {
             .ok_or_else(|| DbError::Query("no active transaction".into()))?;
         self.txn_snapshot = None;
         self.txn_adj_deltas = None;
-        // Invalidate node cache at commit time so subsequent reads see the
-        // committed state.  We invalidate everything rather than tracking
-        // exactly which nodes were mutated during the transaction.
-        self.node_cache_invalidate_all();
         Ok(())
     }
 
@@ -846,57 +979,35 @@ impl Graph {
         if self.txn_pending_ops.take().is_none() {
             return Err(DbError::Query("no active transaction".into()));
         }
-        // Step 1: reverse adj deltas to restore pre-transaction adjacency state.
-        // This is O(ops_in_txn) rather than O(all_edges).
-        if let Some(deltas) = self.txn_adj_deltas.take() {
-            for delta in deltas.into_iter().rev() {
-                match delta {
-                    AdjDelta::AddOut { from, entry } => {
-                        if let Some(v) = self.adj_out.get_mut(&from) {
-                            v.retain(|e| e.edge_id != entry.edge_id);
-                        }
-                    }
-                    AdjDelta::AddIn { to, entry } => {
-                        if let Some(v) = self.adj_in.get_mut(&to) {
-                            v.retain(|e| e.edge_id != entry.edge_id);
-                        }
-                    }
-                    AdjDelta::RemoveOut { from, entry } => {
-                        self.adj_out.entry(from).or_default().push(entry);
-                    }
-                    AdjDelta::RemoveIn { to, entry } => {
-                        self.adj_in.entry(to).or_default().push(entry);
-                    }
-                }
-            }
-        }
+        self.txn_adj_deltas = None;
 
         if let Some(snap) = self.txn_snapshot.take() {
-            // Step 2: restore RocksDB to the pre-transaction state.
+            // Step 1: restore all in-memory structures from snapshot (O(1) swaps).
+            self.nodes            = snap.nodes;
+            self.edges            = snap.edges;
+            self.label_index      = snap.label_index;
+            self.edge_label_index = snap.edge_label_index;
+            self.prop_index       = snap.prop_index;
+            self.edge_prop_index  = snap.edge_prop_index;
+            self.index_defs       = snap.index_defs;
+            self.constraint_defs  = snap.constraint_defs;
+
+            // Step 2: restore adjacency from in-memory edges.
+            self.adj_out.clear();
+            self.adj_in.clear();
+            self.adj_label_to_id.clear();
+            self.adj_id_to_label.clear();
+            self.build_adj()?;
+
+            // Step 3: restore RocksDB to match in-memory state.
+            // Bypass insert_node/insert_edge to avoid re-updating in-memory structures.
             self.store.clear_all()?;
-            // Restore in-memory defs first so constraint/index checks during
-            // re-insert use the pre-transaction definitions.
-            self.index_defs = snap.index_defs;
-            self.constraint_defs = snap.constraint_defs;
-            self.prop_index_counts = snap.prop_index_counts;
-            // Suppress adj write-through: adj is already restored via delta
-            // reversal above; the re-insert phase must not double-apply changes.
-            self.suppress_adj = true;
-            for node in snap.nodes {
-                ops::insert_node(self, node)?;
-            }
-            for edge in snap.edges {
-                ops::insert_edge(self, edge)?;
-            }
-            self.suppress_adj = false;
-            // Re-stamp the edge-label-index sentinel (clear_all removed it).
+            ops::write_all_to_rocksdb(self)?;
+            // Re-stamp the edge-label-index sentinel.
             let _ = self.store.put_meta(
                 crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT,
                 b"1",
             );
-            // Flush the node cache: all cached entries refer to the
-            // transaction-era data that has just been discarded.
-            self.node_cache_invalidate_all();
         }
         Ok(())
     }
@@ -979,11 +1090,21 @@ impl Graph {
     }
 
     pub(crate) fn apply_create_index(&mut self, label: &str, property: &str) {
-        self.create_property_index(label, property);
+        // During WAL replay the index_defs record may already include a target.
+        // If the def is for an edge label (and not a node label), create the edge index.
+        let is_node_label = self.label_index.contains_key(label);
+        let is_edge_label = self.edge_label_index.contains_key(label);
+        if is_edge_label && !is_node_label {
+            self.create_edge_property_index(label, property);
+        } else {
+            self.create_property_index(label, property);
+        }
     }
 
     pub(crate) fn apply_drop_index(&mut self, label: &str, property: &str) {
-        self.drop_property_index(label, property);
+        if !self.drop_property_index(label, property) {
+            self.drop_edge_property_index(label, property);
+        }
     }
 
     /// No-op: RocksDB indexes are always consistent.
@@ -994,21 +1115,22 @@ impl Graph {
 // ── Clone ─────────────────────────────────────────────────────────────────────
 
 /// Clone creates a new ephemeral Graph and copies all data from the source.
-/// This is O(nodes + edges) — intended for transaction snapshots, not hot paths.
+/// Used by the Python API; not used for transaction snapshots (those use
+/// `TransactionSnapshot` field clones directly).
 impl Clone for Graph {
     fn clone(&self) -> Self {
         let mut g = Graph::new();
-        // Copy nodes.
-        for node in self.all_nodes() {
-            let _ = ops::insert_node(&mut g, node);
-        }
-        // Copy edges.
-        for edge in self.all_edges() {
-            let _ = ops::insert_edge(&mut g, edge);
-        }
-        // Copy index defs and counts (cloned graph always starts outside a transaction).
-        g.index_defs = self.index_defs.clone();
-        g.prop_index_counts = self.prop_index_counts.clone();
+        // Bulk-copy in-memory maps (no RocksDB involvement needed for the clone).
+        g.nodes            = self.nodes.clone();
+        g.edges            = self.edges.clone();
+        g.label_index      = self.label_index.clone();
+        g.edge_label_index = self.edge_label_index.clone();
+        g.prop_index       = self.prop_index.clone();
+        g.edge_prop_index  = self.edge_prop_index.clone();
+        g.index_defs       = self.index_defs.clone();
+        g.constraint_defs  = self.constraint_defs.clone();
+        // Write everything to the clone's RocksDB (ephemeral temp dir).
+        let _ = ops::write_all_to_rocksdb(&mut g);
         g
     }
 }
@@ -1339,5 +1461,183 @@ mod tests {
         props.insert("age".into(), Value::String("not-a-number".into()));
         // Label is Robot, not Person — should pass.
         g.check_node_constraints(&["Robot".to_string()], &props, None).unwrap();
+    }
+
+    // ── ARCH-2 in-memory structure tests ──────────────────────────────────────
+
+    #[test]
+    fn arch2_in_memory_maps_populated_on_insert() {
+        let mut g = Graph::new();
+        let id = g.alloc_node_id();
+        let mut props = Properties::new();
+        props.insert("name".into(), Value::String("Alice".into()));
+        g.apply_insert_node(make_node(id, &["Person"], props));
+
+        // Verify in-memory maps are directly populated.
+        assert!(g.nodes.contains_key(&id));
+        assert!(g.label_index.get("Person").unwrap().contains(&id));
+        assert_eq!(g.node_count(), 1);
+    }
+
+    #[test]
+    fn arch2_edge_label_index_maintained() {
+        let mut g = Graph::new();
+        let a = g.alloc_node_id();
+        let b = g.alloc_node_id();
+        g.apply_insert_node(make_node(a, &[], Properties::new()));
+        g.apply_insert_node(make_node(b, &[], Properties::new()));
+        let eid = g.alloc_edge_id();
+        g.apply_insert_edge(crate::types::Edge::new(eid, "KNOWS".into(), a, b, Properties::new(), true));
+
+        assert!(g.edges.contains_key(&eid));
+        assert!(g.edge_label_index.get("KNOWS").unwrap().contains(&eid));
+
+        // Delete edge — should remove from both maps.
+        g.apply_delete_edge(eid).unwrap();
+        assert!(!g.edges.contains_key(&eid));
+        assert!(g.edge_label_index.get("KNOWS").map_or(true, |s| s.is_empty()));
+    }
+
+    #[test]
+    fn arch2_prop_index_btree_lookup() {
+        let mut g = Graph::new();
+        g.create_property_index("Person", "age");
+
+        let id1 = g.alloc_node_id();
+        let id2 = g.alloc_node_id();
+        let mut p1 = Properties::new();
+        p1.insert("age".into(), Value::Int(30));
+        let mut p2 = Properties::new();
+        p2.insert("age".into(), Value::Int(40));
+        g.apply_insert_node(make_node(id1, &["Person"], p1));
+        g.apply_insert_node(make_node(id2, &["Person"], p2));
+
+        // Equality lookup.
+        let hits = g.lookup_by_property("Person", "age", &Value::Int(30)).unwrap();
+        assert_eq!(hits, vec![id1]);
+
+        // Range lookup: age > 29 AND age < 41 should return both.
+        let range_hits = g.lookup_by_property_range(
+            "Person", "age",
+            Some((&Value::Int(29), false)),
+            Some((&Value::Int(41), false)),
+        ).unwrap();
+        assert_eq!(range_hits.len(), 2);
+    }
+
+    #[test]
+    fn arch2_rollback_restores_in_memory_state() {
+        let mut g = Graph::new();
+        let id = g.alloc_node_id();
+        g.apply_insert_node(make_node(id, &["Person"], Properties::new()));
+
+        g.begin_transaction().unwrap();
+        let id2 = g.alloc_node_id();
+        g.apply_insert_node(make_node(id2, &["Person"], Properties::new()));
+        assert_eq!(g.node_count(), 2);
+
+        g.rollback_transaction().unwrap();
+        // Both in-memory maps and RocksDB should be back to 1 node.
+        assert_eq!(g.node_count(), 1);
+        assert!(g.nodes.contains_key(&id));
+        assert!(!g.nodes.contains_key(&id2));
+        assert!(g.label_index.get("Person").unwrap().contains(&id));
+        assert!(!g.label_index.get("Person").unwrap().contains(&id2));
+    }
+
+    // ── Edge property index tests ─────────────────────────────────────────────
+
+    #[test]
+    fn edge_prop_index_created_and_queried() {
+        let mut g = Graph::new();
+        let a = g.alloc_node_id();
+        let b = g.alloc_node_id();
+        g.apply_insert_node(make_node(a, &[], Properties::new()));
+        g.apply_insert_node(make_node(b, &[], Properties::new()));
+
+        let eid = g.alloc_edge_id();
+        let mut ep = Properties::new();
+        ep.insert("since".into(), Value::Int(2020));
+        g.apply_insert_edge(crate::types::Edge::new(eid, "KNOWS".into(), a, b, ep, true));
+
+        g.create_edge_property_index("KNOWS", "since");
+        let hits = g.lookup_by_edge_property("KNOWS", "since", &Value::Int(2020)).unwrap();
+        assert_eq!(hits, vec![eid]);
+
+        // No hit for a different value.
+        let no_hits = g.lookup_by_edge_property("KNOWS", "since", &Value::Int(2021)).unwrap();
+        assert!(no_hits.is_empty());
+    }
+
+    #[test]
+    fn edge_prop_index_maintained_on_set_and_delete() {
+        let mut g = Graph::new();
+        g.create_edge_property_index("KNOWS", "weight");
+
+        let a = g.alloc_node_id();
+        let b = g.alloc_node_id();
+        g.apply_insert_node(make_node(a, &[], Properties::new()));
+        g.apply_insert_node(make_node(b, &[], Properties::new()));
+
+        let eid = g.alloc_edge_id();
+        let mut ep = Properties::new();
+        ep.insert("weight".into(), Value::Int(5));
+        g.apply_insert_edge(crate::types::Edge::new(eid, "KNOWS".into(), a, b, ep, true));
+
+        assert!(g.lookup_by_edge_property("KNOWS", "weight", &Value::Int(5)).unwrap().contains(&eid));
+
+        // Update property.
+        g.apply_set_edge_property(eid, "weight".into(), Value::Int(10)).unwrap();
+        assert!(g.lookup_by_edge_property("KNOWS", "weight", &Value::Int(5)).unwrap().is_empty());
+        assert!(g.lookup_by_edge_property("KNOWS", "weight", &Value::Int(10)).unwrap().contains(&eid));
+
+        // Delete edge.
+        g.apply_delete_edge(eid).unwrap();
+        assert!(g.lookup_by_edge_property("KNOWS", "weight", &Value::Int(10)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn edge_prop_index_range_query() {
+        let mut g = Graph::new();
+        g.create_edge_property_index("TRANSFER", "amount");
+
+        let a = g.alloc_node_id();
+        let b = g.alloc_node_id();
+        g.apply_insert_node(make_node(a, &[], Properties::new()));
+        g.apply_insert_node(make_node(b, &[], Properties::new()));
+
+        for amount in [100i64, 200, 300, 400, 500] {
+            let eid = g.alloc_edge_id();
+            let mut ep = Properties::new();
+            ep.insert("amount".into(), Value::Int(amount));
+            g.apply_insert_edge(crate::types::Edge::new(eid, "TRANSFER".into(), a, b, ep, true));
+        }
+
+        // Range: 200 <= amount <= 400 → 3 hits
+        let hits = g.lookup_by_edge_property_range(
+            "TRANSFER", "amount",
+            Some((&Value::Int(200), true)),
+            Some((&Value::Int(400), true)),
+        ).unwrap();
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn edge_prop_index_drop_clears_data() {
+        let mut g = Graph::new();
+        let a = g.alloc_node_id();
+        let b = g.alloc_node_id();
+        g.apply_insert_node(make_node(a, &[], Properties::new()));
+        g.apply_insert_node(make_node(b, &[], Properties::new()));
+
+        let eid = g.alloc_edge_id();
+        let mut ep = Properties::new();
+        ep.insert("since".into(), Value::Int(2020));
+        g.apply_insert_edge(crate::types::Edge::new(eid, "KNOWS".into(), a, b, ep, true));
+        g.create_edge_property_index("KNOWS", "since");
+
+        g.drop_edge_property_index("KNOWS", "since");
+        assert!(!g.has_edge_property_index("KNOWS", "since"));
+        assert!(g.lookup_by_edge_property("KNOWS", "since", &Value::Int(2020)).is_none());
     }
 }

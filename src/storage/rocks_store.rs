@@ -60,15 +60,11 @@ const CF_ADJ_IN: &str = "adj_in";
 const CF_LABEL_IDX: &str = "label_idx";
 const CF_EDGE_LABEL_IDX: &str = "edge_label_idx";
 const CF_PROP_IDX: &str = "prop_idx";
+/// Edge property index CF — mirrors prop_idx but keyed by edge label.
+const CF_EDGE_PROP_IDX: &str = "edge_prop_idx";
 const CF_META: &str = "meta";
 
 /// Ordered list of every column family name used by this schema.
-///
-/// Passed to `DB::open_cf_descriptors` so that RocksDB creates any missing CFs
-/// on first open and opens all existing ones on subsequent opens.  The order is
-/// arbitrary but must be stable — changing it does not affect correctness, but
-/// removing an entry will cause RocksDB to reject the database as having an
-/// unknown CF.
 pub(crate) const ALL_CFS: &[&str] = &[
     CF_NODES,
     CF_EDGES,
@@ -77,6 +73,7 @@ pub(crate) const ALL_CFS: &[&str] = &[
     CF_LABEL_IDX,
     CF_EDGE_LABEL_IDX,
     CF_PROP_IDX,
+    CF_EDGE_PROP_IDX,
     CF_META,
 ];
 
@@ -1217,7 +1214,7 @@ impl RocksStore {
 
         let data_cfs = [
             CF_NODES, CF_EDGES, CF_ADJ_OUT, CF_ADJ_IN,
-            CF_LABEL_IDX, CF_EDGE_LABEL_IDX, CF_PROP_IDX,
+            CF_LABEL_IDX, CF_EDGE_LABEL_IDX, CF_PROP_IDX, CF_EDGE_PROP_IDX,
         ];
 
         let mut batch = WriteBatch::default();
@@ -1263,6 +1260,103 @@ impl RocksStore {
     /// minimize recovery time on the next open.
     pub fn flush(&self) -> Result<(), DbError> {
         self.db.flush().map_err(|e| DbError::RocksDb(e.to_string()))
+    }
+
+    // ── Bulk startup scan methods (ARCH-2) ────────────────────────────────────
+
+    /// Return the raw serialized bytes of every node in the `nodes` CF.
+    /// Used by `Graph::open()` for the single startup pass that populates
+    /// the in-memory `nodes` and `label_index` maps.
+    pub fn all_nodes_raw(&self) -> Result<Vec<Vec<u8>>, DbError> {
+        let cf = self.db.cf_handle(CF_NODES).expect("nodes CF");
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        let mut out = Vec::new();
+        for item in iter {
+            let (_, val) = item.map_err(|e| DbError::RocksDb(e.to_string()))?;
+            out.push(val.to_vec());
+        }
+        Ok(out)
+    }
+
+    /// Return the raw serialized bytes of every edge in the `edges` CF.
+    /// Used by `Graph::open()` for the single startup pass that populates
+    /// the in-memory `edges` and `edge_label_index` maps.
+    pub fn all_edges_raw(&self) -> Result<Vec<Vec<u8>>, DbError> {
+        let cf = self.db.cf_handle(CF_EDGES).expect("edges CF");
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        let mut out = Vec::new();
+        for item in iter {
+            let (_, val) = item.map_err(|e| DbError::RocksDb(e.to_string()))?;
+            out.push(val.to_vec());
+        }
+        Ok(out)
+    }
+
+    // ── edge_prop_idx CF write-through methods ───────────────────────────────
+
+    /// Build the key for an edge property index entry.
+    /// Format: `label \0 property \0 encoded_value \0 edge_id(16 bytes BE)`
+    fn edge_prop_idx_key(label: &str, prop: &str, encoded_val: &str, edge_id: u128) -> Vec<u8> {
+        let mut k = Vec::new();
+        k.extend_from_slice(label.as_bytes());
+        k.push(0);
+        k.extend_from_slice(prop.as_bytes());
+        k.push(0);
+        k.extend_from_slice(encoded_val.as_bytes());
+        k.push(0);
+        k.extend_from_slice(&edge_id.to_be_bytes());
+        k
+    }
+
+    /// Stage an edge_prop_idx insertion into `batch`.
+    pub fn put_edge_prop_entry(
+        &self,
+        batch: &mut WriteBatch,
+        label: &str,
+        prop: &str,
+        encoded_val: &str,
+        edge_id: u128,
+    ) {
+        let cf = self.db.cf_handle(CF_EDGE_PROP_IDX).expect("edge_prop_idx CF");
+        batch.put_cf(&cf, Self::edge_prop_idx_key(label, prop, encoded_val, edge_id), b"");
+    }
+
+    /// Stage an edge_prop_idx deletion into `batch`.
+    pub fn delete_edge_prop_entry(
+        &self,
+        batch: &mut WriteBatch,
+        label: &str,
+        prop: &str,
+        encoded_val: &str,
+        edge_id: u128,
+    ) {
+        let cf = self.db.cf_handle(CF_EDGE_PROP_IDX).expect("edge_prop_idx CF");
+        batch.delete_cf(&cf, Self::edge_prop_idx_key(label, prop, encoded_val, edge_id));
+    }
+
+    /// Delete all edge_prop_idx entries for (label, prop) — used by DROP INDEX.
+    pub fn delete_edge_prop_range(&self, label: &str, prop: &str) -> Result<(), DbError> {
+        let cf = self.db.cf_handle(CF_EDGE_PROP_IDX).expect("edge_prop_idx CF");
+        // Collect keys first to avoid iterator invalidation.
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(label.as_bytes());
+        prefix.push(0);
+        prefix.extend_from_slice(prop.as_bytes());
+        prefix.push(0);
+
+        let mode = IteratorMode::From(prefix.as_slice(), Direction::Forward);
+        let iter = self.db.iterator_cf(&cf, mode);
+        let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+        for item in iter {
+            let (key, _) = item.map_err(|e| DbError::RocksDb(e.to_string()))?;
+            if !key.starts_with(prefix.as_slice()) { break; }
+            keys_to_delete.push(key.to_vec());
+        }
+        let mut batch = WriteBatch::default();
+        for k in keys_to_delete {
+            batch.delete_cf(&cf, k);
+        }
+        self.db.write(batch).map_err(|e| DbError::RocksDb(e.to_string()))
     }
 }
 

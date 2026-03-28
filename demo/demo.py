@@ -144,6 +144,18 @@ with minigdb.open(GRAPH) as db:
     )
     show("Reachable from Alice (1-3 hops):", rows)
 
+    # -- STARTS WITH index pushdown ------------------------------------------
+
+    section("STARTS WITH index prefix scan")
+    # Create a property index on :Person(name), then query using startsWith().
+    # The executor detects the prefix predicate and routes it through the index
+    # (O(log n + matches)) rather than scanning all :Person nodes.
+    db.query('CREATE INDEX ON :Person(name)')
+    rows = db.query(
+        'MATCH (n:Person) WHERE startsWith(n.name, "A") RETURN n.name ORDER BY n.name'
+    )
+    show("People whose name starts with 'A' (index-accelerated):", rows)
+
 
 # ── optional: DataFrame output via query_df / query_pandas ───────────────────
 

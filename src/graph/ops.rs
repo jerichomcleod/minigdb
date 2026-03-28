@@ -76,13 +76,22 @@ fn decode_edge(data: &[u8]) -> Result<Edge, DbError> {
 // ── prop_idx CF maintenance helpers ──────────────────────────────────────────
 
 /// Queue a prop_idx addition in `batch` for every (label, property) of `node`
-/// that has a declared index.
-fn batch_prop_add(graph: &Graph, batch: &mut rocksdb::WriteBatch, node: &Node) {
+/// that has a declared index.  Updates the in-memory count in `graph.prop_index_counts`.
+fn batch_prop_add(graph: &mut Graph, batch: &mut rocksdb::WriteBatch, node: &Node) {
     for label in &node.labels {
         for (prop, val) in &node.properties {
-            if graph.has_property_index(label, prop) {
+            let has_idx = graph.index_defs.iter().any(|d| &d.label == label && &d.property == prop);
+            if has_idx {
                 if let Some(encoded) = value_index_key(val) {
                     graph.store.put_prop_entry(batch, label, prop, &encoded, node.id.0);
+                    let new_count = {
+                        let e = graph.prop_index_counts
+                            .entry((label.clone(), prop.clone()))
+                            .or_insert(0);
+                        *e += 1;
+                        *e
+                    };
+                    graph.store.set_prop_count_batch(batch, label, prop, new_count);
                 }
             }
         }
@@ -90,23 +99,33 @@ fn batch_prop_add(graph: &Graph, batch: &mut rocksdb::WriteBatch, node: &Node) {
 }
 
 /// Queue removal of a single (label, property, old_value, node_id) entry.
+/// Updates the in-memory count in `graph.prop_index_counts`.
 fn batch_prop_remove_val(
-    graph: &Graph,
+    graph: &mut Graph,
     batch: &mut rocksdb::WriteBatch,
     label: &str,
     prop: &str,
     old_val: &Value,
     node_id: u128,
 ) {
-    if graph.has_property_index(label, prop) {
+    let has_idx = graph.index_defs.iter().any(|d| d.label == label && d.property == prop);
+    if has_idx {
         if let Some(encoded) = value_index_key(old_val) {
             graph.store.delete_prop_entry(batch, label, prop, &encoded, node_id);
+            let new_count = {
+                let e = graph.prop_index_counts
+                    .entry((label.to_string(), prop.to_string()))
+                    .or_insert(0);
+                *e = e.saturating_sub(1);
+                *e
+            };
+            graph.store.set_prop_count_batch(batch, label, prop, new_count);
         }
     }
 }
 
 /// Queue removal of all prop_idx entries for `node` (for delete operations).
-fn batch_prop_remove_node(graph: &Graph, batch: &mut rocksdb::WriteBatch, node: &Node) {
+fn batch_prop_remove_node(graph: &mut Graph, batch: &mut rocksdb::WriteBatch, node: &Node) {
     for label in &node.labels {
         for (prop, val) in &node.properties {
             batch_prop_remove_val(graph, batch, label, prop, val, node.id.0);
@@ -215,6 +234,7 @@ pub(crate) fn insert_node(graph: &mut Graph, node: Node) -> Result<(), DbError> 
     graph.store.put_node_batch(&mut batch, node.id.0, &data);
     for label in &node.labels {
         graph.store.put_label_entry(&mut batch, label, node.id.0);
+        graph.store.adjust_label_count_batch(&mut batch, label, 1);
     }
     // Maintain prop_idx CF for declared indexes.
     batch_prop_add(graph, &mut batch, &node);
@@ -251,6 +271,19 @@ pub(crate) fn insert_edge(graph: &mut Graph, edge: Edge) -> Result<(), DbError> 
     graph.store.put_meta_batch(&mut batch, META_EDGE_COUNT, &(count + 1).to_le_bytes());
 
     graph.store.write(batch)?;
+
+    // Write-through: keep in-memory adjacency in sync with RocksDB.
+    let label_id = graph.intern_adj_label(&edge.label);
+    let from = edge.from_node;
+    let to   = edge.to_node;
+    let eid  = edge.id;
+    graph.adj_add_out(from, crate::graph::AdjEntry { edge_id: eid, neighbor: to,   label_id });
+    graph.adj_add_in (to,   crate::graph::AdjEntry { edge_id: eid, neighbor: from, label_id });
+    if !edge.directed {
+        graph.adj_add_out(to,   crate::graph::AdjEntry { edge_id: eid, neighbor: from, label_id });
+        graph.adj_add_in (from, crate::graph::AdjEntry { edge_id: eid, neighbor: to,   label_id });
+    }
+
     Ok(())
 }
 
@@ -282,14 +315,24 @@ pub(crate) fn set_node_property(
         if let Some(ref old) = old_val {
             batch_prop_remove_val(graph, &mut batch, label, &key, old, node_id.0);
         }
-        if graph.has_property_index(label, &key) {
+        let has_idx = graph.index_defs.iter().any(|d| &d.label == label && d.property == key);
+        if has_idx {
             if let Some(encoded) = value_index_key(node.properties.get(&key).unwrap()) {
                 graph.store.put_prop_entry(&mut batch, label, &key, &encoded, node_id.0);
+                let new_count = {
+                    let e = graph.prop_index_counts
+                        .entry((label.clone(), key.clone()))
+                        .or_insert(0);
+                    *e += 1;
+                    *e
+                };
+                graph.store.set_prop_count_batch(&mut batch, label, &key, new_count);
             }
         }
     }
 
     graph.store.write(batch)?;
+    graph.node_cache_invalidate(node_id);
     Ok(())
 }
 
@@ -334,6 +377,7 @@ pub(crate) fn remove_node_property(
         }
     }
     graph.store.write(batch)?;
+    graph.node_cache_invalidate(node_id);
     Ok(())
 }
 
@@ -374,17 +418,28 @@ pub(crate) fn add_node_label(
     let mut batch = RocksStore::batch();
     graph.store.put_node_batch(&mut batch, node_id.0, &new_data);
     graph.store.put_label_entry(&mut batch, &label, node_id.0);
+    graph.store.adjust_label_count_batch(&mut batch, &label, 1);
 
     // Maintain prop_idx for the new label.
     for (prop, val) in &node.properties {
-        if graph.has_property_index(&label, prop) {
+        let has_idx = graph.index_defs.iter().any(|d| d.label == label && &d.property == prop);
+        if has_idx {
             if let Some(encoded) = value_index_key(val) {
                 graph.store.put_prop_entry(&mut batch, &label, prop, &encoded, node_id.0);
+                let new_count = {
+                    let e = graph.prop_index_counts
+                        .entry((label.clone(), prop.clone()))
+                        .or_insert(0);
+                    *e += 1;
+                    *e
+                };
+                graph.store.set_prop_count_batch(&mut batch, &label, prop, new_count);
             }
         }
     }
 
     graph.store.write(batch)?;
+    graph.node_cache_invalidate(node_id);
     Ok(())
 }
 
@@ -411,7 +466,9 @@ pub(crate) fn remove_node_label(
     let new_data = encode_node(&node)?;
     graph.store.put_node_batch(&mut batch, node_id.0, &new_data);
     graph.store.delete_label_entry(&mut batch, label, node_id.0);
+    graph.store.adjust_label_count_batch(&mut batch, label, -1);
     graph.store.write(batch)?;
+    graph.node_cache_invalidate(node_id);
     Ok(())
 }
 
@@ -434,10 +491,12 @@ pub(crate) fn delete_node(graph: &mut Graph, node_id: NodeId) -> Result<(), DbEr
     graph.store.delete_node_batch(&mut batch, node_id.0);
     for lbl in &node.labels {
         graph.store.delete_label_entry(&mut batch, lbl, node_id.0);
+        graph.store.adjust_label_count_batch(&mut batch, lbl, -1);
     }
     batch_prop_remove_node(graph, &mut batch, &node);
     graph.store.put_meta_batch(&mut batch, META_NODE_COUNT, &count.saturating_sub(1).to_le_bytes());
     graph.store.write(batch)?;
+    graph.node_cache_invalidate(node_id);
     Ok(())
 }
 
@@ -463,6 +522,7 @@ pub(crate) fn delete_node_detach(graph: &mut Graph, node_id: NodeId) -> Result<(
         graph.store.delete_node_batch(&mut batch, node_id.0);
         for lbl in &node.labels {
             graph.store.delete_label_entry(&mut batch, lbl, node_id.0);
+            graph.store.adjust_label_count_batch(&mut batch, lbl, -1);
         }
         batch_prop_remove_node(graph, &mut batch, &node);
         graph.store.put_meta_batch(
@@ -471,6 +531,7 @@ pub(crate) fn delete_node_detach(graph: &mut Graph, node_id: NodeId) -> Result<(
             &count.saturating_sub(1).to_le_bytes(),
         );
         graph.store.write(batch)?;
+        graph.node_cache_invalidate(node_id);
     }
     Ok(())
 }
@@ -517,5 +578,14 @@ pub(crate) fn delete_edge(graph: &mut Graph, edge_id: EdgeId) -> Result<(), DbEr
     }
     graph.store.put_meta_batch(&mut batch, META_EDGE_COUNT, &count.saturating_sub(1).to_le_bytes());
     graph.store.write(batch)?;
+
+    // Write-through: remove from in-memory adjacency.
+    graph.adj_remove_out(edge.from_node, edge_id);
+    graph.adj_remove_in (edge.to_node,   edge_id);
+    if !edge.directed {
+        graph.adj_remove_out(edge.to_node,   edge_id);
+        graph.adj_remove_in (edge.from_node, edge_id);
+    }
+
     Ok(())
 }

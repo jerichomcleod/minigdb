@@ -13,6 +13,8 @@ and compiled via maturin.  They cover:
   - Error handling (parse errors, invalid paths, bad graph names)
   - Persistence across open/close cycles (snapshot + WAL replay)
   - Graph name validation enforced by ``minigdb.open()``
+  - STARTS WITH index pushdown (property index prefix scan)
+  - Adjacency-delta rollback (edge insert/delete inside a transaction)
 
 Prerequisites:
     maturin develop --features python
@@ -356,3 +358,106 @@ def test_open_too_long_raises():
     """open() must reject names longer than 64 characters."""
     with pytest.raises(RuntimeError, match="1–64"):
         minigdb.open('x' * 65)
+
+
+# ── STARTS WITH index pushdown ────────────────────────────────────────────────
+
+
+def test_starts_with_uses_index(db):
+    """startsWith() in WHERE should use the property index and return only matching nodes."""
+    db.query('CREATE INDEX ON :Product(sku)')
+    db.query('INSERT (:Product {sku: "BOOK-001", title: "Rust Programming"})')
+    db.query('INSERT (:Product {sku: "BOOK-002", title: "Graph Databases"})')
+    db.query('INSERT (:Product {sku: "ELEC-100", title: "Keyboard"})')
+
+    rows = db.query('MATCH (p:Product) WHERE startsWith(p.sku, "BOOK") RETURN p.title ORDER BY p.title')
+    assert len(rows) == 2
+    assert rows[0]['p.title'] == 'Graph Databases'
+    assert rows[1]['p.title'] == 'Rust Programming'
+
+
+def test_starts_with_no_index_fallback(db):
+    """startsWith() without an index should still return the correct results via full scan."""
+    db.query('INSERT (:Product {sku: "BOOK-001", title: "Rust Programming"})')
+    db.query('INSERT (:Product {sku: "BOOK-002", title: "Graph Databases"})')
+    db.query('INSERT (:Product {sku: "ELEC-100", title: "Keyboard"})')
+
+    rows = db.query('MATCH (p:Product) WHERE startsWith(p.sku, "BOOK") RETURN p.title ORDER BY p.title')
+    assert len(rows) == 2
+    assert {r['p.title'] for r in rows} == {'Rust Programming', 'Graph Databases'}
+
+
+def test_starts_with_empty_prefix_returns_all_strings(db):
+    """startsWith(prop, "") should match every node that has the property set."""
+    db.query('CREATE INDEX ON :Item(code)')
+    db.query('INSERT (:Item {code: "A1"})')
+    db.query('INSERT (:Item {code: "B2"})')
+    db.query('INSERT (:Item {code: "C3"})')
+
+    rows = db.query('MATCH (i:Item) WHERE startsWith(i.code, "") RETURN i.code ORDER BY i.code')
+    assert [r['i.code'] for r in rows] == ['A1', 'B2', 'C3']
+
+
+def test_starts_with_no_match_returns_empty(db):
+    """startsWith() with a prefix that matches nothing should return an empty result."""
+    db.query('CREATE INDEX ON :Item(code)')
+    db.query('INSERT (:Item {code: "A1"})')
+    db.query('INSERT (:Item {code: "A2"})')
+
+    rows = db.query('MATCH (i:Item) WHERE startsWith(i.code, "Z") RETURN i.code')
+    assert rows == []
+
+
+def test_starts_with_combined_with_and(db):
+    """startsWith() combined with another AND predicate should apply both filters."""
+    db.query('CREATE INDEX ON :Person(name)')
+    db.query('INSERT (:Person {name: "Alice", age: 30})')
+    db.query('INSERT (:Person {name: "Alan",  age: 20})')
+    db.query('INSERT (:Person {name: "Bob",   age: 25})')
+
+    rows = db.query(
+        'MATCH (n:Person) WHERE startsWith(n.name, "Al") AND n.age > 25 RETURN n.name'
+    )
+    assert len(rows) == 1
+    assert rows[0]['n.name'] == 'Alice'
+
+
+# ── adjacency-delta rollback ──────────────────────────────────────────────────
+
+
+def test_rollback_edge_insert(db):
+    """An edge inserted inside a transaction must disappear after rollback."""
+    db.query('INSERT (:Person {name: "Alice"})')
+    db.query('INSERT (:Person {name: "Bob"})')
+
+    db.begin()
+    db.query('MATCH (a:Person {name:"Alice"}), (b:Person {name:"Bob"}) INSERT (a)-[:KNOWS]->(b)')
+    # Confirm the edge is visible inside the transaction.
+    rows = db.query('MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name')
+    assert len(rows) == 1
+
+    db.rollback()
+
+    # After rollback the edge must be gone.
+    rows = db.query('MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name')
+    assert rows == []
+
+
+def test_rollback_edge_delete(db):
+    """An edge deleted inside a transaction must be restored after rollback."""
+    db.query('INSERT (:Person {name: "Alice"})')
+    db.query('INSERT (:Person {name: "Bob"})')
+    db.query('MATCH (a:Person {name:"Alice"}), (b:Person {name:"Bob"}) INSERT (a)-[:KNOWS]->(b)')
+
+    db.begin()
+    db.query('MATCH (a:Person {name:"Alice"})-[r:KNOWS]->(b:Person {name:"Bob"}) DELETE r')
+    rows = db.query('MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name')
+    assert rows == []  # gone inside the transaction
+
+    db.rollback()
+
+    # After rollback the edge must be restored.
+    rows = db.query('MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name')
+    assert len(rows) == 1
+    assert rows[0]['a.name'] == 'Alice'
+    assert rows[0]['b.name'] == 'Bob'

@@ -9,8 +9,8 @@ An embedded property-graph database built in Rust on RocksDB. Property graph mod
 **Feature highlights:**
 - GQL queries: `MATCH`, `INSERT`, `SET`, `DELETE`, variable-length paths, `OPTIONAL MATCH`, `UNION`, aggregates, `WITH`, `UNWIND`
 - 15 built-in graph algorithms: PageRank, shortest path, community detection (Louvain/Leiden), centrality measures, max-flow, and more
-- Property indexes, uniqueness and type constraints, parameterized queries, CSV bulk import
-- Multi-graph support, explicit transactions
+- Property indexes with automatic pushdown for equality, range, and `startsWith()` prefix queries; uniqueness and type constraints, parameterized queries, CSV bulk import
+- Multi-graph support, explicit transactions with O(ops-in-transaction) adjacency rollback
 - TCP server with authentication, per-connection transaction isolation, and an embedded web GUI
 - Python bindings via PyO3 with polars/pandas DataFrame output
 

@@ -217,8 +217,11 @@ impl MiniGdb {
     fn query(&mut self, py: Python<'_>, gql: &str) -> PyResult<Vec<PyObject>> {
         let graph = self.graph.as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("database is closed"))?;
-        let (rows, _ops) = crate::query_capturing(gql, graph, &mut self.next_txn_id)
-            .map_err(db_err_to_py)?;
+        // Release the GIL while executing the query so the Jupyter kernel
+        // event loop (and VS Code's cell-status polling) stays responsive.
+        let (rows, _ops) = py.allow_threads(|| {
+            crate::query_capturing(gql, graph, &mut self.next_txn_id)
+        }).map_err(db_err_to_py)?;
         // Graph manages transaction buffering internally (R3).
 
         // Convert rows (HashMap<String, Value>) to Python dicts.
@@ -547,14 +550,15 @@ impl MiniGdb {
     ///
     /// After `close()` returns, the same path can be opened again in the same
     /// process.  Calling `close()` on an already-closed instance is a no-op.
-    fn close(&mut self) -> PyResult<()> {
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(mut graph) = self.graph.take() {
             // Implicit rollback: discard any uncommitted buffered ops.
             if graph.is_in_transaction() {
                 let _ = graph.rollback_transaction();
             }
             if let Some(storage) = self.storage.take() {
-                storage.checkpoint(&graph).map_err(db_err_to_py)?;
+                py.allow_threads(|| storage.checkpoint(&graph))
+                    .map_err(db_err_to_py)?;
             }
             // `graph` drops here → RocksDB handle released → lock freed.
         }
@@ -574,11 +578,12 @@ impl MiniGdb {
     /// Returns `False` so that any active exception is **not** suppressed.
     fn __exit__(
         &mut self,
+        py: Python<'_>,
         _exc_type: PyObject,
         _exc_val: PyObject,
         _exc_tb: PyObject,
     ) -> PyResult<bool> {
-        self.close()?;
+        self.close(py)?;
         Ok(false) // do not suppress exceptions
     }
 }
@@ -630,12 +635,13 @@ fn graph_dir(name: &str) -> PyResult<PathBuf> {
 /// Raises `OSError` on I/O failure and `RuntimeError` on invalid names or
 /// storage engine errors.
 #[pyfunction]
-fn open(name: &str) -> PyResult<MiniGdb> {
+fn open(py: Python<'_>, name: &str) -> PyResult<MiniGdb> {
     let dir = graph_dir(name)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| PyOSError::new_err(e.to_string()))?;
 
-    let (storage, graph) = StorageManager::open(&dir).map_err(db_err_to_py)?;
+    let (storage, graph) = py.allow_threads(|| StorageManager::open(&dir))
+        .map_err(db_err_to_py)?;
 
     Ok(MiniGdb { graph: Some(graph), storage: Some(storage), next_txn_id: 0 })
 }
@@ -649,12 +655,13 @@ fn open(name: &str) -> PyResult<MiniGdb> {
 ///
 /// Raises `OSError` on I/O failure and `RuntimeError` on storage engine errors.
 #[pyfunction]
-fn open_at(path: &str) -> PyResult<MiniGdb> {
+fn open_at(py: Python<'_>, path: &str) -> PyResult<MiniGdb> {
     let dir = std::path::Path::new(path);
     std::fs::create_dir_all(dir)
         .map_err(|e| PyOSError::new_err(e.to_string()))?;
 
-    let (storage, graph) = StorageManager::open(dir).map_err(db_err_to_py)?;
+    let (storage, graph) = py.allow_threads(|| StorageManager::open(dir))
+        .map_err(db_err_to_py)?;
 
     Ok(MiniGdb { graph: Some(graph), storage: Some(storage), next_txn_id: 0 })
 }

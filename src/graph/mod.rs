@@ -10,14 +10,59 @@
 pub(crate) mod ops;
 pub mod constraints;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
 
 use serde::{Deserialize, Serialize};
 
 use crate::storage::rocks_store::RocksStore;
 use crate::transaction::operation::Operation;
 use crate::types::{ulid_new, DbError, Edge, EdgeId, Node, NodeId, Value};
+
+// ── Property cache type alias ─────────────────────────────────────────────────
+
+/// Concurrent LRU cache for deserialized `Node` objects (PERF-6).
+///
+/// `moka::sync::Cache` is thread-safe without external locking, making it safe
+/// to read from Rayon parallel projection threads (PERF-12).  The cache stores
+/// `Arc<Node>` so cloning a cached value is cheap (ref-count bump only).
+///
+/// Capacity: 100 K nodes — enough to keep hub nodes warm across queries on
+/// typical graphs.  Entries are invalidated at `COMMIT` time (not at write-
+/// buffer time) to preserve correct read-your-own-writes semantics.
+type NodeCache = moka::sync::Cache<NodeId, Arc<Node>>;
+
+// ── In-memory adjacency ───────────────────────────────────────────────────────
+
+/// A single entry in the in-memory adjacency list.
+///
+/// `label_id` is an interned index into `Graph::adj_id_to_label`; using a
+/// `u32` instead of a heap-allocated `String` reduces per-entry overhead from
+/// ~32 bytes to 4 bytes — critical when storing 40 M+ edges × 2 directions.
+#[derive(Clone)]
+pub struct AdjEntry {
+    pub edge_id: EdgeId,
+    /// The node on the other end of this edge (to_node for adj_out,
+    /// from_node for adj_in).
+    pub neighbor: NodeId,
+    /// Interned edge label ID; resolve via `Graph::adj_label_str`.
+    pub label_id: u32,
+}
+
+/// A single tracked change to the in-memory adjacency list during a transaction.
+///
+/// Accumulated in `Graph::txn_adj_deltas` while a transaction is active.
+/// On `ROLLBACK`, the list is reversed and each delta is inverted to restore
+/// the pre-transaction adjacency state in O(ops_in_txn) rather than
+/// re-scanning all edges from RocksDB (which is O(all_edges)).
+#[derive(Clone)]
+pub(crate) enum AdjDelta {
+    AddOut  { from: NodeId, entry: AdjEntry },
+    AddIn   { to:   NodeId, entry: AdjEntry },
+    RemoveOut { from: NodeId, entry: AdjEntry },
+    RemoveIn  { to:   NodeId, entry: AdjEntry },
+}
 
 /// A declared property index: index all nodes with `label` on the value of `property`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +105,7 @@ struct TransactionSnapshot {
     edges: Vec<crate::types::Edge>,
     index_defs: Vec<PropertyIndexDef>,
     constraint_defs: Vec<constraints::ConstraintDef>,
+    prop_index_counts: HashMap<(String, String), usize>,
 }
 
 pub struct Graph {
@@ -68,6 +114,13 @@ pub struct Graph {
     pub(crate) store: RocksStore,
     /// Declared property index definitions (persisted to meta CF).
     pub(crate) index_defs: Vec<PropertyIndexDef>,
+    /// In-memory cache of property index entry counts.
+    ///
+    /// Maintained alongside every `put_prop_entry` / `delete_prop_entry` call so
+    /// that `SHOW INDEXES` is a pure in-memory scan rather than N RocksDB reads.
+    /// Also eliminates the synchronous read inside `adjust_prop_count_batch` on
+    /// every node insert/update/delete.  Loaded from the meta CF on `open()`.
+    pub(crate) prop_index_counts: HashMap<(String, String), usize>,
     /// Declared constraints (persisted to meta CF under key `constraint_defs`).
     ///
     /// Each [`ConstraintDef`](constraints::ConstraintDef) records a `(kind, label,
@@ -86,7 +139,41 @@ pub struct Graph {
     /// Transient mapping from user-supplied CSV `:ID` strings to their assigned
     /// [`NodeId`]s.  Populated by `LOAD CSV NODES`; consumed by `LOAD CSV EDGES`.
     /// Not persisted to disk.  Cleared by [`Graph::clear_csv_id_map`].
-    pub csv_id_map: std::collections::HashMap<String, NodeId>,
+    pub csv_id_map: HashMap<String, NodeId>,
+
+    // ── Property cache (PERF-6) ───────────────────────────────────────────────
+    //
+    // Concurrent LRU cache for deserialized Node objects.  Avoids repeated
+    // bincode::deserialize calls for hot hub nodes accessed across many queries.
+    // Invalidated at COMMIT time to preserve read-your-own-writes correctness.
+    node_cache: NodeCache,
+
+    // ── In-memory adjacency (ARCH-1) ──────────────────────────────────────────
+    //
+    // Adjacency lists keep (edge_id, neighbor, label_id) in RAM so that graph
+    // traversal is O(degree) RAM access rather than O(degree) RocksDB reads.
+    // Edge labels are interned: each unique label string is stored once in
+    // `adj_id_to_label`; each AdjEntry carries a 4-byte u32 label_id.
+    //
+    // Write-through: every `insert_edge`/`delete_edge` in ops.rs updates these
+    // maps atomically after the RocksDB write.
+    //
+    // Rollback: during a transaction, every adj change is appended to
+    // `txn_adj_deltas`.  On ROLLBACK the delta list is reversed and inverted
+    // (O(ops)), avoiding the O(all_edges) re-scan that a full rebuild would
+    // require.  `suppress_adj` is set during the RocksDB re-insert phase so
+    // that write-through is suppressed while adj is already correct.
+    pub(crate) adj_out: HashMap<NodeId, Vec<AdjEntry>>,
+    pub(crate) adj_in:  HashMap<NodeId, Vec<AdjEntry>>,
+    adj_label_to_id: HashMap<String, u32>,
+    adj_id_to_label: Vec<String>,
+    /// Accumulated adj changes for the current transaction.
+    /// `None` when no transaction is active.
+    pub(crate) txn_adj_deltas: Option<Vec<AdjDelta>>,
+    /// Set to `true` during the RocksDB re-insert phase of ROLLBACK so that
+    /// adj write-through (and delta recording) is suppressed entirely.
+    pub(crate) suppress_adj: bool,
+
     /// If `Some`, this Graph owns a temp directory deleted on drop.
     /// Declared LAST so it drops after `store` closes RocksDB.
     _owned_dir: Option<CleanupDir>,
@@ -113,10 +200,18 @@ impl Graph {
         Self {
             store,
             index_defs: Vec::new(),
+            prop_index_counts: HashMap::new(),
             constraint_defs: Vec::new(),
             txn_pending_ops: None,
             txn_snapshot: None,
-            csv_id_map: std::collections::HashMap::new(),
+            csv_id_map: HashMap::new(),
+            node_cache: moka::sync::Cache::new(100_000),
+            adj_out: HashMap::new(),
+            adj_in:  HashMap::new(),
+            adj_label_to_id: HashMap::new(),
+            adj_id_to_label: Vec::new(),
+            txn_adj_deltas: None,
+            suppress_adj: false,
             _owned_dir: Some(CleanupDir(dir)),
         }
     }
@@ -130,16 +225,36 @@ impl Graph {
         let mut graph = Self {
             store,
             index_defs,
+            prop_index_counts: HashMap::new(),
             constraint_defs,
             txn_pending_ops: None,
             txn_snapshot: None,
-            csv_id_map: std::collections::HashMap::new(),
+            csv_id_map: HashMap::new(),
+            node_cache: moka::sync::Cache::new(100_000),
+            adj_out: HashMap::new(),
+            adj_in:  HashMap::new(),
+            adj_label_to_id: HashMap::new(),
+            adj_id_to_label: Vec::new(),
+            txn_adj_deltas: None,
+            suppress_adj: false,
             _owned_dir: None,
         };
         // Migration R6: populate edge_label_idx CF for existing databases that
         // pre-date this index. The meta key is written once after the rebuild.
         if graph.store.get_meta(crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT)?.is_none() {
             ops::rebuild_edge_label_idx(&mut graph)?;
+        }
+        // Build in-memory adjacency list from RocksDB adj_out CF.
+        // For large graphs this takes a few seconds; all subsequent traversal
+        // is ns-per-hop instead of μs-per-hop.
+        graph.build_adj()?;
+        // Load prop index counts into memory so SHOW INDEXES is a pure in-memory scan.
+        let idx_keys: Vec<(String, String)> = graph.index_defs.iter()
+            .map(|d| (d.label.clone(), d.property.clone()))
+            .collect();
+        for (label, property) in idx_keys {
+            let count = graph.store.get_prop_count(&label, &property);
+            graph.prop_index_counts.insert((label, property), count);
         }
         Ok(graph)
     }
@@ -157,11 +272,33 @@ impl Graph {
     // ── Read API ─────────────────────────────────────────────────────────────
 
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
-        self.store
+        // Fast path: serve from the concurrent node cache (PERF-6).
+        // The cache stores Arc<Node> so cloning is a ref-count bump only.
+        if let Some(cached) = self.node_cache.get(&id) {
+            return Some((*cached).clone());
+        }
+        // Slow path: load from RocksDB and populate the cache.
+        let node = self.store
             .get_node_raw(id.0)
             .ok()
             .flatten()
-            .and_then(|data| bincode::deserialize(&data).ok())
+            .and_then(|data| bincode::deserialize::<Node>(&data).ok())?;
+        self.node_cache.insert(id, Arc::new(node.clone()));
+        Some(node)
+    }
+
+    /// Invalidate the cache entry for `id`.
+    ///
+    /// Called on COMMIT (not at write-buffer time) so that reads within an
+    /// active transaction always see the latest written value without stale
+    /// cached data interfering.
+    pub(crate) fn node_cache_invalidate(&self, id: NodeId) {
+        self.node_cache.invalidate(&id);
+    }
+
+    /// Invalidate the entire node cache — used on ROLLBACK.
+    pub(crate) fn node_cache_invalidate_all(&self) {
+        self.node_cache.invalidate_all();
     }
 
     pub fn get_edge(&self, id: EdgeId) -> Option<Edge> {
@@ -176,6 +313,16 @@ impl Graph {
         self.store.node_count().unwrap_or(0) as usize
     }
 
+    /// Return the number of nodes carrying `label` — O(1) meta CF lookup.
+    ///
+    /// Used by the query planner (PERF-10) to order disconnected MATCH patterns
+    /// by ascending cardinality.  Returns 0 for labels that existed before the
+    /// counter was introduced; the counter is lazily initialized on the next
+    /// write to that label.
+    pub fn count_nodes_with_label(&self, label: &str) -> usize {
+        self.store.get_label_count(label)
+    }
+
     pub fn edge_count(&self) -> usize {
         self.store.edge_count().unwrap_or(0) as usize
     }
@@ -183,6 +330,27 @@ impl Graph {
     pub fn nodes_by_label(&self, label: &str) -> Vec<NodeId> {
         self.store
             .scan_label(label)
+            .unwrap_or_default()
+            .into_iter()
+            .map(NodeId)
+            .collect()
+    }
+
+    /// Like `nodes_by_label` but stops after `limit` IDs — avoids a full scan
+    /// when LIMIT is known and no ORDER BY / WHERE is present.
+    pub fn nodes_by_label_limit(&self, label: &str, limit: usize) -> Vec<NodeId> {
+        self.store
+            .scan_label_limit(label, limit)
+            .unwrap_or_default()
+            .into_iter()
+            .map(NodeId)
+            .collect()
+    }
+
+    /// Return the first `limit` node IDs from the store without a full scan.
+    pub fn first_n_node_ids(&self, limit: usize) -> Vec<NodeId> {
+        self.store
+            .all_node_ids_limit(limit)
             .unwrap_or_default()
             .into_iter()
             .map(NodeId)
@@ -200,21 +368,174 @@ impl Graph {
     }
 
     pub fn outgoing_edges(&self, node_id: NodeId) -> Vec<EdgeId> {
-        self.store
-            .scan_adj_out(node_id.0)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(eid, _, _)| EdgeId(eid))
-            .collect()
+        if let Some(entries) = self.adj_out.get(&node_id) {
+            entries.iter().map(|e| e.edge_id).collect()
+        } else {
+            self.store
+                .scan_adj_out(node_id.0)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(eid, _, _)| EdgeId(eid))
+                .collect()
+        }
     }
 
     pub fn incoming_edges(&self, node_id: NodeId) -> Vec<EdgeId> {
-        self.store
-            .scan_adj_in(node_id.0)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(eid, _, _)| EdgeId(eid))
-            .collect()
+        if let Some(entries) = self.adj_in.get(&node_id) {
+            entries.iter().map(|e| e.edge_id).collect()
+        } else {
+            self.store
+                .scan_adj_in(node_id.0)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(eid, _, _)| EdgeId(eid))
+                .collect()
+        }
+    }
+
+    // ── In-memory adjacency API (ARCH-1) ──────────────────────────────────────
+
+    /// Return the in-memory out-adjacency list for `node_id`.
+    ///
+    /// Each `AdjEntry` carries `(edge_id, to_node, label_id)` — no RocksDB
+    /// lookup required.  Use `adj_label_str(entry.label_id)` to recover the
+    /// label string.  Returns an empty slice for nodes with no outgoing edges.
+    pub fn neighbors_out_mem(&self, node_id: NodeId) -> &[AdjEntry] {
+        self.adj_out.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Return the in-memory in-adjacency list for `node_id`.
+    ///
+    /// Each `AdjEntry` carries `(edge_id, from_node, label_id)`.
+    pub fn neighbors_in_mem(&self, node_id: NodeId) -> &[AdjEntry] {
+        self.adj_in.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Resolve an interned label ID to its string.
+    ///
+    /// Panics on out-of-range IDs (indicates a bug in write-through maintenance).
+    #[inline]
+    pub fn adj_label_str(&self, label_id: u32) -> &str {
+        &self.adj_id_to_label[label_id as usize]
+    }
+
+    /// Intern `label` and return its stable `u32` ID.
+    ///
+    /// If `label` has been seen before, returns the existing ID.  Otherwise
+    /// assigns the next sequential ID and stores the string.  Called during
+    /// `insert_edge` write-through and during `build_adj`.
+    pub(crate) fn intern_adj_label(&mut self, label: &str) -> u32 {
+        if let Some(&id) = self.adj_label_to_id.get(label) {
+            return id;
+        }
+        let id = self.adj_id_to_label.len() as u32;
+        self.adj_id_to_label.push(label.to_owned());
+        self.adj_label_to_id.insert(label.to_owned(), id);
+        id
+    }
+
+    /// Add an entry to the out-adjacency list for `from`.  Called by
+    /// `ops::insert_edge` immediately after the RocksDB write.
+    pub(crate) fn adj_add_out(&mut self, from: NodeId, entry: AdjEntry) {
+        if self.suppress_adj { return; }
+        if let Some(deltas) = &mut self.txn_adj_deltas {
+            deltas.push(AdjDelta::AddOut { from, entry: entry.clone() });
+        }
+        self.adj_out.entry(from).or_default().push(entry);
+    }
+
+    /// Add an entry to the in-adjacency list for `to`.
+    pub(crate) fn adj_add_in(&mut self, to: NodeId, entry: AdjEntry) {
+        if self.suppress_adj { return; }
+        if let Some(deltas) = &mut self.txn_adj_deltas {
+            deltas.push(AdjDelta::AddIn { to, entry: entry.clone() });
+        }
+        self.adj_in.entry(to).or_default().push(entry);
+    }
+
+    /// Remove all entries with `edge_id` from the out-adjacency list of `from`.
+    /// Captures removed entries into the transaction delta when active.
+    pub(crate) fn adj_remove_out(&mut self, from: NodeId, edge_id: EdgeId) {
+        if self.suppress_adj { return; }
+        if let Some(v) = self.adj_out.get_mut(&from) {
+            if self.txn_adj_deltas.is_some() {
+                // Capture entries before removing so rollback can restore them.
+                let mut removed = Vec::new();
+                v.retain(|e| {
+                    if e.edge_id == edge_id { removed.push(e.clone()); false } else { true }
+                });
+                if let Some(deltas) = &mut self.txn_adj_deltas {
+                    for entry in removed {
+                        deltas.push(AdjDelta::RemoveOut { from, entry });
+                    }
+                }
+            } else {
+                v.retain(|e| e.edge_id != edge_id);
+            }
+        }
+    }
+
+    /// Remove all entries with `edge_id` from the in-adjacency list of `to`.
+    /// Captures removed entries into the transaction delta when active.
+    pub(crate) fn adj_remove_in(&mut self, to: NodeId, edge_id: EdgeId) {
+        if self.suppress_adj { return; }
+        if let Some(v) = self.adj_in.get_mut(&to) {
+            if self.txn_adj_deltas.is_some() {
+                let mut removed = Vec::new();
+                v.retain(|e| {
+                    if e.edge_id == edge_id { removed.push(e.clone()); false } else { true }
+                });
+                if let Some(deltas) = &mut self.txn_adj_deltas {
+                    for entry in removed {
+                        deltas.push(AdjDelta::RemoveIn { to, entry });
+                    }
+                }
+            } else {
+                v.retain(|e| e.edge_id != edge_id);
+            }
+        }
+    }
+
+    /// Populate `adj_out` and `adj_in` from the RocksDB `adj_out` CF.
+    ///
+    /// Called once in `Graph::open()`.  For large graphs (40 M+ edges) this
+    /// takes a few seconds on first open after ARCH-1 is deployed; all
+    /// subsequent traversal is ns-per-hop rather than μs-per-hop.
+    ///
+    /// For new (empty) graphs this is a no-op.
+    pub(crate) fn build_adj(&mut self) -> Result<(), DbError> {
+        let all_entries = self.store.iter_all_adj_out()?;
+        if all_entries.is_empty() {
+            return Ok(());
+        }
+
+        // Pre-size: use average out-degree to reduce Vec reallocation.
+        let approx_node_count = self.store.node_count().unwrap_or(1).max(1) as usize;
+        let avg_degree = (all_entries.len() / approx_node_count).max(1);
+
+        eprintln!(
+            "minigdb: loading adjacency index ({} edges)...",
+            all_entries.len()
+        );
+
+        for (from, edge_id, to, label) in all_entries {
+            let label_id = self.intern_adj_label(&label);
+            let from_id = NodeId(from);
+            let to_id   = NodeId(to);
+            let eid     = EdgeId(edge_id);
+
+            self.adj_out
+                .entry(from_id)
+                .or_insert_with(|| Vec::with_capacity(avg_degree))
+                .push(AdjEntry { edge_id: eid, neighbor: to_id, label_id });
+            self.adj_in
+                .entry(to_id)
+                .or_insert_with(|| Vec::with_capacity(avg_degree))
+                .push(AdjEntry { edge_id: eid, neighbor: from_id, label_id });
+        }
+
+        eprintln!("minigdb: adjacency index ready.");
+        Ok(())
     }
 
     pub fn all_nodes(&self) -> Vec<Node> {
@@ -262,18 +583,20 @@ impl Graph {
         // Populate prop_idx CF for existing nodes.
         let node_ids = self.store.scan_label(label).unwrap_or_default();
         let mut batch = crate::storage::rocks_store::RocksStore::batch();
+        let mut count = 0usize;
         for nid in node_ids {
-            if let Ok(Some(data)) = self.store.get_node_raw(nid) {
-                if let Ok(node) = bincode::deserialize::<Node>(&data) {
-                    if let Some(val) = node.properties.get(property) {
-                        if let Some(encoded) = crate::types::value_index_key(val) {
-                            self.store.put_prop_entry(&mut batch, label, property, &encoded, nid);
-                        }
+            if let Some(node) = self.get_node(NodeId(nid)) {
+                if let Some(val) = node.properties.get(property) {
+                    if let Some(encoded) = crate::types::value_index_key(val) {
+                        self.store.put_prop_entry(&mut batch, label, property, &encoded, nid);
+                        count += 1;
                     }
                 }
             }
         }
+        self.store.set_prop_count_batch(&mut batch, label, property, count);
         let _ = self.store.write(batch);
+        self.prop_index_counts.insert((label.to_string(), property.to_string()), count);
         true
     }
 
@@ -287,15 +610,20 @@ impl Graph {
         }
         let _ = ops::save_index_defs(&self.store, &self.index_defs);
         let _ = self.store.delete_prop_range(label, property);
+        let _ = self.store.delete_prop_count(label, property);
+        self.prop_index_counts.remove(&(label.to_string(), property.to_string()));
         true
     }
 
-    /// List all declared indexes with their entry counts (from the prop_idx CF).
+    /// List all declared indexes with their entry counts (O(1) in-memory lookup).
     pub fn list_property_indexes(&self) -> Vec<(String, String, usize)> {
         self.index_defs
             .iter()
             .map(|def| {
-                let count = self.store.count_prop_entries(&def.label, &def.property);
+                let count = self.prop_index_counts
+                    .get(&(def.label.clone(), def.property.clone()))
+                    .copied()
+                    .unwrap_or(0);
                 (def.label.clone(), def.property.clone(), count)
             })
             .collect()
@@ -351,6 +679,29 @@ impl Graph {
                     lo_enc.as_ref().map(|(k, incl)| (k.as_str(), *incl)),
                     hi_enc.as_ref().map(|(k, incl)| (k.as_str(), *incl)),
                 )
+                .unwrap_or_default()
+                .into_iter()
+                .map(NodeId)
+                .collect(),
+        )
+    }
+
+    /// Look up nodes whose `(label, property)` string value starts with `prefix`.
+    ///
+    /// Uses the `prop_idx` CF prefix scan — O(log n + matches).
+    /// Returns `None` if no index exists for `(label, property)`.
+    pub fn lookup_by_property_prefix(
+        &self,
+        label: &str,
+        property: &str,
+        prefix: &str,
+    ) -> Option<Vec<NodeId>> {
+        if !self.has_property_index(label, property) {
+            return None;
+        }
+        Some(
+            self.store
+                .scan_prop_prefix(label, property, prefix)
                 .unwrap_or_default()
                 .into_iter()
                 .map(NodeId)
@@ -467,8 +818,10 @@ impl Graph {
             edges: self.all_edges(),
             index_defs: self.index_defs.clone(),
             constraint_defs: self.constraint_defs.clone(),
+            prop_index_counts: self.prop_index_counts.clone(),
         }));
         self.txn_pending_ops = Some(Vec::new());
+        self.txn_adj_deltas = Some(Vec::new());
         Ok(())
     }
 
@@ -479,6 +832,11 @@ impl Graph {
             .take()
             .ok_or_else(|| DbError::Query("no active transaction".into()))?;
         self.txn_snapshot = None;
+        self.txn_adj_deltas = None;
+        // Invalidate node cache at commit time so subsequent reads see the
+        // committed state.  We invalidate everything rather than tracking
+        // exactly which nodes were mutated during the transaction.
+        self.node_cache_invalidate_all();
         Ok(())
     }
 
@@ -488,25 +846,57 @@ impl Graph {
         if self.txn_pending_ops.take().is_none() {
             return Err(DbError::Query("no active transaction".into()));
         }
+        // Step 1: reverse adj deltas to restore pre-transaction adjacency state.
+        // This is O(ops_in_txn) rather than O(all_edges).
+        if let Some(deltas) = self.txn_adj_deltas.take() {
+            for delta in deltas.into_iter().rev() {
+                match delta {
+                    AdjDelta::AddOut { from, entry } => {
+                        if let Some(v) = self.adj_out.get_mut(&from) {
+                            v.retain(|e| e.edge_id != entry.edge_id);
+                        }
+                    }
+                    AdjDelta::AddIn { to, entry } => {
+                        if let Some(v) = self.adj_in.get_mut(&to) {
+                            v.retain(|e| e.edge_id != entry.edge_id);
+                        }
+                    }
+                    AdjDelta::RemoveOut { from, entry } => {
+                        self.adj_out.entry(from).or_default().push(entry);
+                    }
+                    AdjDelta::RemoveIn { to, entry } => {
+                        self.adj_in.entry(to).or_default().push(entry);
+                    }
+                }
+            }
+        }
+
         if let Some(snap) = self.txn_snapshot.take() {
-            // Wipe all data written during the transaction.
+            // Step 2: restore RocksDB to the pre-transaction state.
             self.store.clear_all()?;
             // Restore in-memory defs first so constraint/index checks during
             // re-insert use the pre-transaction definitions.
             self.index_defs = snap.index_defs;
             self.constraint_defs = snap.constraint_defs;
-            // Re-insert all pre-transaction nodes and edges.
+            self.prop_index_counts = snap.prop_index_counts;
+            // Suppress adj write-through: adj is already restored via delta
+            // reversal above; the re-insert phase must not double-apply changes.
+            self.suppress_adj = true;
             for node in snap.nodes {
                 ops::insert_node(self, node)?;
             }
             for edge in snap.edges {
                 ops::insert_edge(self, edge)?;
             }
+            self.suppress_adj = false;
             // Re-stamp the edge-label-index sentinel (clear_all removed it).
             let _ = self.store.put_meta(
                 crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT,
                 b"1",
             );
+            // Flush the node cache: all cached entries refer to the
+            // transaction-era data that has just been discarded.
+            self.node_cache_invalidate_all();
         }
         Ok(())
     }
@@ -616,8 +1006,9 @@ impl Clone for Graph {
         for edge in self.all_edges() {
             let _ = ops::insert_edge(&mut g, edge);
         }
-        // Copy index defs (cloned graph always starts outside a transaction).
+        // Copy index defs and counts (cloned graph always starts outside a transaction).
         g.index_defs = self.index_defs.clone();
+        g.prop_index_counts = self.prop_index_counts.clone();
         g
     }
 }

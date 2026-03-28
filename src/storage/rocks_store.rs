@@ -44,7 +44,10 @@
 
 use std::path::Path;
 
-use rocksdb::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, Direction, IteratorMode, Options,
+    SliceTransform, WriteBatch, DB,
+};
 
 use crate::types::DbError;
 
@@ -91,6 +94,24 @@ pub(crate) const META_NODE_COUNT: &[u8] = b"node_count";
 /// `edge_count()` is an O(1) point lookup rather than a full CF scan.
 pub(crate) const META_EDGE_COUNT: &[u8] = b"edge_count";
 
+/// Prefix for per-index entry-count keys in the `meta` CF.
+///
+/// The full key is `b"pidx_cnt\0" + label + b"\0" + property`.
+/// Maintained alongside every `put_prop_entry` / `delete_prop_entry` so that
+/// `SHOW INDEXES` is an O(1) meta lookup rather than a full prop_idx scan.
+pub(crate) const META_PIDX_CNT_PREFIX: &[u8] = b"pidx_cnt\0";
+
+/// Prefix for per-label node-count keys in the `meta` CF.
+///
+/// The full key is `b"label_cnt\0" + label`.  Maintained alongside every
+/// `put_label_entry` / `delete_label_entry` so that label cardinality queries
+/// are O(1) meta lookups rather than full `label_idx` scans.  Used by the
+/// query planner for join-ordering (PERF-10).
+///
+/// INVARIANT: writers hold the per-graph mutex (server) or are single-threaded
+/// (REPL), so the read-modify-write in `adjust_label_count_batch` is safe.
+pub(crate) const META_LABEL_CNT_PREFIX: &[u8] = b"label_cnt\0";
+
 /// Written once into the `meta` CF to signal that the `edge_label_idx` CF is
 /// fully populated.
 ///
@@ -133,22 +154,78 @@ impl RocksStore {
         // its own files inside it.
         std::fs::create_dir_all(path)?;
 
+        // One shared block cache for all CFs — global LRU eviction.
+        // Separate caches per CF would prevent hot CFs from borrowing capacity
+        // from cold ones.  32 MiB default; sufficient for typical embedded use.
+        let shared_cache = Cache::new_lru_cache(32 * 1024 * 1024);
+
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        // Reserve half the available cores for query threads; cap compaction
+        // background jobs at that value so they don't starve the foreground.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        db_opts.set_max_background_jobs((cores / 2).max(2) as i32);
 
-        // Build one descriptor per CF with default options.  Custom
-        // per-CF options (bloom filters, compaction strategies) can be
-        // added here in the future without changing callers.
         let cf_descs: Vec<ColumnFamilyDescriptor> = ALL_CFS
             .iter()
-            .map(|&name| ColumnFamilyDescriptor::new(name, Options::default()))
+            .map(|&name| {
+                ColumnFamilyDescriptor::new(name, Self::cf_options(name, &shared_cache))
+            })
             .collect();
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descs)
             .map_err(|e| DbError::RocksDb(e.to_string()))?;
 
         Ok(Self { db })
+    }
+
+    /// Build per-CF RocksDB options tuned to each CF's access pattern.
+    ///
+    /// All CFs share a single `Cache` for global LRU eviction.  Point-lookup
+    /// CFs (`nodes`, `edges`, `meta`) use whole-key bloom filters.  Fixed-
+    /// prefix scan CFs (`adj_out`, `adj_in`) use prefix bloom filters with a
+    /// matching `SliceTransform`.  Variable-prefix CFs (label/prop indexes) use
+    /// whole-key blooms (no prefix extractor, since label lengths vary).
+    ///
+    /// NOTE: `set_optimize_filters_for_hits` is intentionally omitted.  That
+    /// flag disables bloom filters on the bottommost SST level — exactly where
+    /// most data lives.  It is only safe at 100% positive-lookup rates, which
+    /// we cannot guarantee (e.g. lookups for deleted nodes).
+    fn cf_options(name: &str, cache: &Cache) -> Options {
+        let mut opts = Options::default();
+        let mut block_opts = BlockBasedOptions::default();
+
+        // Share the cache and keep bloom/index blocks in it so they survive
+        // across block evictions.
+        block_opts.set_block_cache(cache);
+        block_opts.set_cache_index_and_filter_blocks(true);
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+
+        match name {
+            // Point-lookup CFs: whole-key bloom (no prefix extractor)
+            CF_NODES | CF_EDGES | CF_META => {
+                block_opts.set_bloom_filter(10.0, false);
+            }
+            // Fixed-prefix scan CFs: prefix bloom + SliceTransform on the
+            // 16-byte node ID prefix so seeks skip non-matching blocks.
+            CF_ADJ_OUT | CF_ADJ_IN => {
+                block_opts.set_bloom_filter(10.0, true);
+                opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(16));
+            }
+            // Variable-prefix CFs: whole-key bloom (label lengths vary, so no
+            // fixed prefix extractor is safe here)
+            _ => {
+                block_opts.set_bloom_filter(10.0, false);
+            }
+        }
+
+        opts.set_block_based_table_factory(&block_opts);
+        opts.set_write_buffer_size(64 * 1024 * 1024); // 64 MiB memtable
+        opts.set_max_write_buffer_number(3);
+        opts
     }
 
     // ── Key encoding ─────────────────────────────────────────────────────────
@@ -315,6 +392,22 @@ impl RocksStore {
         Ok(ids)
     }
 
+    /// Like `all_node_ids` but stops after collecting `limit` IDs.
+    ///
+    /// Avoids a full CF scan when only a bounded prefix of nodes is needed
+    /// (e.g. MATCH … RETURN … LIMIT N with no ORDER BY or WHERE).
+    pub fn all_node_ids_limit(&self, limit: usize) -> Result<Vec<u128>, DbError> {
+        let cf = self.db.cf_handle(CF_NODES).expect("nodes CF");
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        let mut ids = Vec::with_capacity(limit.min(1024));
+        for item in iter {
+            if ids.len() >= limit { break; }
+            let (key, _) = item.map_err(|e| DbError::RocksDb(e.to_string()))?;
+            ids.push(Self::bytes_to_id(&key));
+        }
+        Ok(ids)
+    }
+
     // ── Edges CF ─────────────────────────────────────────────────────────────
 
     /// Write raw serialized bytes for an edge directly to RocksDB (outside a batch).
@@ -455,6 +548,27 @@ impl RocksStore {
         self.scan_adj(CF_ADJ_IN, to)
     }
 
+    /// Scan the entire `adj_out` CF and yield `(from, edge_id, to, label)` for
+    /// every entry.  Used at graph-open time to build the in-memory adjacency
+    /// list (ARCH-1).  Not suitable for per-node hot paths.
+    pub fn iter_all_adj_out(&self) -> Result<Vec<(u128, u128, u128, String)>, DbError> {
+        let cf = self.db.cf_handle(CF_ADJ_OUT).expect("adj_out CF");
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        let mut entries = Vec::new();
+        for item in iter {
+            let (key, val) = item.map_err(|e| DbError::RocksDb(e.to_string()))?;
+            if key.len() < 32 || val.len() < 16 {
+                continue; // corrupt entry — skip silently
+            }
+            let from     = Self::bytes_to_id(&key[..16]);
+            let edge_id  = Self::bytes_to_id(&key[16..32]);
+            let to       = Self::bytes_to_id(&val[..16]);
+            let label    = String::from_utf8_lossy(&val[16..]).into_owned();
+            entries.push((from, edge_id, to, label));
+        }
+        Ok(entries)
+    }
+
     /// Shared implementation for `scan_adj_out` and `scan_adj_in`.
     ///
     /// Seeks to the 16-byte big-endian prefix for `node_id` and iterates
@@ -533,6 +647,25 @@ impl RocksStore {
             if !key.starts_with(prefix.as_slice()) { break; }
 
             // The node ID occupies the last 16 bytes after the prefix.
+            if key.len() >= prefix.len() + 16 {
+                ids.push(Self::bytes_to_id(&key[prefix.len()..]));
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Like `scan_label` but stops after collecting `limit` IDs.
+    pub fn scan_label_limit(&self, label: &str, limit: usize) -> Result<Vec<u128>, DbError> {
+        let prefix = Self::label_prefix(label);
+        let cf = self.db.cf_handle(CF_LABEL_IDX).expect("label_idx CF");
+        let mode = IteratorMode::From(prefix.as_slice(), Direction::Forward);
+        let iter = self.db.iterator_cf(&cf, mode);
+
+        let mut ids = Vec::new();
+        for item in iter {
+            if ids.len() >= limit { break; }
+            let (key, _) = item.map_err(|e| DbError::RocksDb(e.to_string()))?;
+            if !key.starts_with(prefix.as_slice()) { break; }
             if key.len() >= prefix.len() + 16 {
                 ids.push(Self::bytes_to_id(&key[prefix.len()..]));
             }
@@ -778,6 +911,66 @@ impl RocksStore {
         Ok(ids)
     }
 
+    /// Scan node IDs whose `(label, prop)` string value starts with `string_prefix`.
+    ///
+    /// The prop_idx encodes string values as `"S:<value>"`.  This method seeks to
+    /// `label\0prop\0S:<string_prefix>` and iterates forward, collecting node IDs
+    /// while the encoded value has the `"S:<string_prefix>"` prefix.  When the
+    /// encoded value diverges (e.g. the next lexicographic string no longer starts
+    /// with `string_prefix`), iteration stops.
+    ///
+    /// The seek is O(log n); the iteration is O(matches).  Returns an empty vec
+    /// if the index has no matching entries.
+    pub fn scan_prop_prefix(
+        &self,
+        label: &str,
+        prop: &str,
+        string_prefix: &str,
+    ) -> Result<Vec<u128>, DbError> {
+        let range_pfx = Self::prop_range_prefix(label, prop);
+        // String values in the prop_idx are encoded as "S:<original_value>".
+        let encoded_prefix = format!("S:{}", string_prefix);
+
+        // Seek directly to the first possible match.
+        let mut seek_key = range_pfx.clone();
+        seek_key.extend_from_slice(encoded_prefix.as_bytes());
+
+        let cf = self.db.cf_handle(CF_PROP_IDX).expect("prop_idx CF");
+        let mode = IteratorMode::From(seek_key.as_slice(), Direction::Forward);
+        let iter = self.db.iterator_cf(&cf, mode);
+
+        let mut ids = Vec::new();
+        for item in iter {
+            let (key, _) = item.map_err(|e| DbError::RocksDb(e.to_string()))?;
+
+            // Stop when we've left the (label, prop) namespace entirely.
+            if !key.starts_with(range_pfx.as_slice()) {
+                break;
+            }
+
+            // Key layout: range_pfx | encoded_val | \0 | node_id (16 bytes be).
+            if key.len() < range_pfx.len() + 17 {
+                continue;
+            }
+
+            let enc_end = key.len() - 17;
+            let enc_bytes = &key[range_pfx.len()..enc_end];
+            let enc_val = match std::str::from_utf8(enc_bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            // Entries are sorted, so once the encoded value no longer matches
+            // our prefix there cannot be any further matches.
+            if !enc_val.starts_with(encoded_prefix.as_str()) {
+                break;
+            }
+
+            ids.push(Self::bytes_to_id(&key[enc_end + 1..]));
+        }
+        Ok(ids)
+    }
+
     /// Delete every `prop_idx` entry whose key starts with `label \0 prop \0`.
     ///
     /// Used by `DROP INDEX ON :Label(prop)` to remove all stored index data
@@ -812,20 +1005,125 @@ impl RocksStore {
         self.db.write(batch).map_err(|e| DbError::RocksDb(e.to_string()))
     }
 
-    /// Count all `prop_idx` entries for `(label, prop)`.
+    // ── prop_idx entry counter ───────────────────────────────────────────────
+
+    /// Build the meta key for the prop_idx entry-count for `(label, prop)`.
+    fn prop_count_meta_key(label: &str, prop: &str) -> Vec<u8> {
+        let mut k = META_PIDX_CNT_PREFIX.to_vec();
+        k.extend_from_slice(label.as_bytes());
+        k.push(0);
+        k.extend_from_slice(prop.as_bytes());
+        k
+    }
+
+    /// Return the persisted entry count for the `(label, prop)` index.
     ///
-    /// Used by `SHOW INDEXES` to report index cardinality (the number of
-    /// indexed nodes) without loading the nodes themselves.  Performs a
-    /// bounded forward scan that stops as soon as the `(label, prop)` prefix
-    /// is exhausted.
-    pub fn count_prop_entries(&self, label: &str, prop: &str) -> usize {
-        let prefix = Self::prop_range_prefix(label, prop);
-        let cf = self.db.cf_handle(CF_PROP_IDX).expect("prop_idx CF");
-        let mode = IteratorMode::From(prefix.as_slice(), Direction::Forward);
-        self.db.iterator_cf(&cf, mode)
-            .map_while(|item| item.ok())
-            .take_while(|(key, _)| key.starts_with(prefix.as_slice()))
-            .count()
+    /// O(1) meta CF point lookup — replaces the old `count_prop_entries` full scan.
+    /// Returns 0 for indexes created before this counter was introduced (they
+    /// will be updated on the next write; callers can also call
+    /// `rebuild_prop_count` for an immediate repair).
+    pub fn get_prop_count(&self, label: &str, prop: &str) -> usize {
+        let key = Self::prop_count_meta_key(label, prop);
+        self.get_meta(&key)
+            .ok()
+            .flatten()
+            .map(|v| u64_from_le(&v) as usize)
+            .unwrap_or(0)
+    }
+
+
+    /// Overwrite the persisted entry count with an exact value.
+    ///
+    /// Used during `CREATE INDEX` after the full index build loop so a single
+    /// accurate count is written rather than incrementing once per node.
+    pub fn set_prop_count_batch(&self, batch: &mut WriteBatch, label: &str, prop: &str, count: usize) {
+        let key = Self::prop_count_meta_key(label, prop);
+        self.put_meta_batch(batch, &key, &(count as u64).to_le_bytes());
+    }
+
+    /// Delete the persisted entry count for `(label, prop)` (used on DROP INDEX).
+    pub fn delete_prop_count(&self, label: &str, prop: &str) -> Result<(), DbError> {
+        let key = Self::prop_count_meta_key(label, prop);
+        let cf = self.db.cf_handle(CF_META).expect("meta CF");
+        self.db.delete_cf(&cf, &key).map_err(|e| DbError::RocksDb(e.to_string()))
+    }
+
+    // ── label_idx node-count counters ────────────────────────────────────────
+
+    /// Build the meta key for the node count under `label`.
+    fn label_count_meta_key(label: &str) -> Vec<u8> {
+        let mut k = META_LABEL_CNT_PREFIX.to_vec();
+        k.extend_from_slice(label.as_bytes());
+        k
+    }
+
+    /// Return the persisted node count for `label` — O(1) meta point lookup.
+    ///
+    /// Returns 0 for labels that existed before this counter was introduced;
+    /// the counter is lazily initialized on the next write via
+    /// `adjust_label_count_batch`.
+    pub fn get_label_count(&self, label: &str) -> usize {
+        let key = Self::label_count_meta_key(label);
+        self.get_meta(&key)
+            .ok()
+            .flatten()
+            .map(|v| u64_from_le(&v) as usize)
+            .unwrap_or(0)
+    }
+
+    /// Like `get_label_count` but returns `None` when the counter has never
+    /// been written (databases created before the label-count meta key was
+    /// introduced).  Used by the query executor's COUNT fast path to avoid
+    /// incorrectly returning 0 for a label that has nodes but no stored counter.
+    pub fn get_label_count_if_known(&self, label: &str) -> Option<usize> {
+        let key = Self::label_count_meta_key(label);
+        self.get_meta(&key)
+            .ok()
+            .flatten()
+            .map(|v| u64_from_le(&v) as usize)
+    }
+
+    /// Count nodes with `label` by doing a full `label_idx` prefix scan.
+    ///
+    /// Expensive — only called once per label for lazy migration when
+    /// `adjust_label_count_batch` finds no persisted counter yet.
+    pub(crate) fn count_label_entries(&self, label: &str) -> usize {
+        self.scan_label(label).unwrap_or_default().len()
+    }
+
+    /// Adjust the persisted node count for `label` by `delta` (+1 or −1).
+    ///
+    /// Staged into `batch` so the counter update is atomic with the
+    /// corresponding `put_label_entry` / `delete_label_entry` call.
+    ///
+    /// On first write to a label that has no persisted counter (pre-existing
+    /// data), initializes the counter via a one-time `label_idx` scan so it
+    /// stays accurate going forward.
+    pub fn adjust_label_count_batch(
+        &self,
+        batch: &mut WriteBatch,
+        label: &str,
+        delta: i64,
+    ) {
+        let key = Self::label_count_meta_key(label);
+        let cur = match self.get_meta(&key) {
+            Ok(Some(v)) => u64_from_le(&v) as i64,
+            // Counter absent — lazy migration: scan once to initialize.
+            Ok(None) => self.count_label_entries(label) as i64,
+            Err(_) => 0,
+        };
+        let new_val = (cur + delta).max(0) as u64;
+        self.put_meta_batch(batch, &key, &new_val.to_le_bytes());
+    }
+
+    /// Delete the persisted node count for `label`.
+    #[allow(dead_code)]
+    pub fn delete_label_count(&self, label: &str) -> Result<(), DbError> {
+        let key = Self::label_count_meta_key(label);
+        let cf = self.db.cf_handle(CF_META).expect("meta CF");
+        self.db
+            .delete_cf(&cf, &key)
+            .map_err(|e| DbError::RocksDb(e.to_string()))
     }
 
     // ── Meta CF ───────────────────────────────────────────────────────────────
@@ -1499,6 +1797,59 @@ mod tests {
         let mut ids = s.scan_prop_range("P", "x", Some((&lo_enc, false)), None).unwrap();
         ids.sort();
         assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn prop_prefix_scan_basic() {
+        // Insert names: Alice, Albert, Bob. Prefix "Al" should return Alice and Albert.
+        let (s, _d) = open();
+        let mut batch = RocksStore::batch();
+        s.put_prop_entry(&mut batch, "P", "name", "S:Alice",  1);
+        s.put_prop_entry(&mut batch, "P", "name", "S:Albert", 2);
+        s.put_prop_entry(&mut batch, "P", "name", "S:Bob",    3);
+        s.write(batch).unwrap();
+
+        let mut ids = s.scan_prop_prefix("P", "name", "Al").unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn prop_prefix_scan_empty_prefix_returns_all_strings() {
+        // Empty prefix "" matches every string value.
+        let (s, _d) = open();
+        let mut batch = RocksStore::batch();
+        s.put_prop_entry(&mut batch, "P", "name", "S:Alice", 1);
+        s.put_prop_entry(&mut batch, "P", "name", "S:Bob",   2);
+        s.write(batch).unwrap();
+
+        let mut ids = s.scan_prop_prefix("P", "name", "").unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn prop_prefix_scan_no_match_returns_empty() {
+        let (s, _d) = open();
+        let mut batch = RocksStore::batch();
+        s.put_prop_entry(&mut batch, "P", "name", "S:Alice", 1);
+        s.write(batch).unwrap();
+
+        let ids = s.scan_prop_prefix("P", "name", "Z").unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn prop_prefix_scan_does_not_bleed_across_properties() {
+        // Entries for a different property must not appear.
+        let (s, _d) = open();
+        let mut batch = RocksStore::batch();
+        s.put_prop_entry(&mut batch, "P", "name",  "S:Alice", 1);
+        s.put_prop_entry(&mut batch, "P", "alias", "S:Al",    2); // different prop
+        s.write(batch).unwrap();
+
+        let ids = s.scan_prop_prefix("P", "name", "Al").unwrap();
+        assert_eq!(ids, vec![1]);
     }
 
     #[test]

@@ -27,7 +27,7 @@ CALL wcc(minSize: 2) YIELD node, component, size RETURN component, collect(node)
 |-----------|----------------|--------|
 | **shortestPath** | `source` (ULID, required), `target` (ULID, optional — all nodes if omitted), `weight` (edge property name), `direction`, `maxCost` | `source`, `target`, `cost`, `path` |
 
-Uses Dijkstra's algorithm. Requires non-negative edge weights when `weight` is specified.
+Uses Dijkstra's algorithm. Requires non-negative edge weights when `weight` is specified. For unweighted single-pair queries (both `source` and `target` given, no `weight` or `maxCost`), **bidirectional BFS** is used on graphs with 64+ nodes, which in practice visits far fewer nodes than a full Dijkstra traversal.
 
 ---
 
@@ -52,6 +52,8 @@ Uses Dijkstra's algorithm. Requires non-negative edge weights when `weight` is s
 | **degreeCentrality** | `direction` ("total"), `normalized` (true) | `node`, `inDegree`, `outDegree`, `totalDegree`, `score` |
 
 `betweennessCentrality` uses the Brandes algorithm. `sampleSize > 0` samples that many source nodes for approximation on large graphs. `closenessCentrality` applies the Wasserman-Faust correction for disconnected graphs when `wfImproved` is true.
+
+> **Performance:** `pageRank`, `betweennessCentrality`, `closenessCentrality`, and `labelPropagation` use Rayon parallel iteration on graphs with 256 or more nodes, scaling across all available CPU cores.
 
 ---
 

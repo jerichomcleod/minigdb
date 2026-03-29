@@ -821,7 +821,7 @@ fn apply_return_clause(
 
 /// The set of aggregate function names recognised by the executor.
 /// The parser lowercases all identifiers, so these are all lowercase.
-const AGG_FUNCTIONS: &[&str] = &["count", "sum", "avg", "min", "max", "collect"];
+const AGG_FUNCTIONS: &[&str] = &["count", "count_distinct", "sum", "avg", "min", "max", "collect"];
 
 /// Returns `true` if `name` is the name of a supported aggregate function.
 fn is_agg_fn(name: &str) -> bool {
@@ -894,6 +894,18 @@ fn aggregate_fn(
                     .count();
                 Ok(Value::Int(n as i64))
             }
+        }
+        "count_distinct" => {
+            let arg = args.first().ok_or_else(|| DbError::Query("count(DISTINCT) requires 1 arg".into()))?;
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for b in group {
+                if let Ok(v) = eval_expr(arg, b, graph) {
+                    if v != Value::Null {
+                        seen.insert(format!("{v:?}"));
+                    }
+                }
+            }
+            Ok(Value::Int(seen.len() as i64))
         }
         "sum" => {
             let arg = args.first().ok_or_else(|| DbError::Query("sum() requires 1 arg".into()))?;
@@ -1616,8 +1628,13 @@ fn expr_display(expr: &Expr) -> String {
         Expr::Var(v) => v.clone(),
         Expr::Property(obj, key) => format!("{}.{}", expr_display(obj), key),
         Expr::Call(name, args) => {
-            let arg_strs: Vec<String> = args.iter().map(expr_display).collect();
-            format!("{}({})", name, arg_strs.join(", "))
+            if name == "count_distinct" {
+                let inner = args.first().map(expr_display).unwrap_or_default();
+                format!("count(DISTINCT {inner})")
+            } else {
+                let arg_strs: Vec<String> = args.iter().map(expr_display).collect();
+                format!("{}({})", name, arg_strs.join(", "))
+            }
         }
         Expr::Literal(v) => format!("{v}"),
         Expr::Star => "*".to_string(),

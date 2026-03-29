@@ -185,6 +185,8 @@ pub async fn serve(
         .route("/api/auth", post(api_auth))
         .route("/api/graphs", get(api_graphs).post(api_create_graph))
         .route("/api/graphs/:name", delete(api_drop_graph))
+        .route("/api/locations", get(api_list_locations).post(api_add_location))
+        .route("/api/locations/:path", delete(api_remove_location))
         .route("/api/query", post(api_query))
         .route("/api/viz", post(api_viz))
         .route("/api/upload/nodes", post(api_upload_nodes))
@@ -320,6 +322,90 @@ async fn api_drop_graph(
         Ok(()) => Json(json!({})).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
     }
+}
+
+// ── /api/locations ────────────────────────────────────────────────────────────
+
+/// `GET /api/locations` — list all registered graph-root directories.
+///
+/// Returns `{"locations": [{"path": "...", "primary": bool}, ...]}` in search
+/// order (primary root first).
+async fn api_list_locations(
+    headers: HeaderMap,
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    auth!(&headers, &s);
+    let locs = s.registry.list_locations().await;
+    let arr: Vec<JsonValue> = locs
+        .into_iter()
+        .map(|(p, primary)| json!({ "path": p.to_string_lossy(), "primary": primary }))
+        .collect();
+    Json(json!({ "locations": arr })).into_response()
+}
+
+/// Request body for `POST /api/locations`.
+#[derive(Deserialize)]
+struct AddLocationBody {
+    path: String,
+}
+
+/// `POST /api/locations` — add a new graph-root directory.
+///
+/// The directory must already exist on the server's filesystem.  Returns `{}`
+/// on success or `400` with `{"error": "..."}` on failure.
+async fn api_add_location(
+    headers: HeaderMap,
+    State(s): State<AppState>,
+    Json(body): Json<AddLocationBody>,
+) -> impl IntoResponse {
+    auth!(&headers, &s);
+    match s.registry.add_location(std::path::PathBuf::from(&body.path)).await {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+/// `DELETE /api/locations/:path` — remove a graph-root directory.
+///
+/// `:path` is URL-encoded.  The primary root cannot be removed.  Returns `{}`
+/// on success or `400` with `{"error": "..."}` on failure.
+async fn api_remove_location(
+    headers: HeaderMap,
+    State(s): State<AppState>,
+    Path(encoded): Path<String>,
+) -> impl IntoResponse {
+    auth!(&headers, &s);
+    // The path arrives percent-encoded; decode it.
+    let decoded = percent_decode(&encoded);
+    match s.registry.remove_location(std::path::Path::new(&decoded)).await {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+/// Percent-decode a URL path segment.
+fn percent_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.bytes().peekable();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h = chars.next().unwrap_or(b'0');
+            let l = chars.next().unwrap_or(b'0');
+            let hex = [h, l];
+            if let Ok(s) = std::str::from_utf8(&hex) {
+                if let Ok(v) = u8::from_str_radix(s, 16) {
+                    out.push(v as char);
+                    continue;
+                }
+            }
+            out.push('%');
+            out.push(h as char);
+            out.push(l as char);
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
 }
 
 // ── /api/query ────────────────────────────────────────────────────────────────

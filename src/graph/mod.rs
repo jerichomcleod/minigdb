@@ -234,11 +234,7 @@ impl Graph {
     /// Performs a full load of all nodes, edges, and indexes from RocksDB into
     /// RAM (ARCH-2).  After `open()` returns, all reads are pure in-memory.
     pub fn open(path: &Path) -> Result<Self, DbError> {
-        let _t0 = std::time::Instant::now();
         let store = RocksStore::open(path)?;
-        eprintln!("[open] RocksStore::open        {:>8.3}s", _t0.elapsed().as_secs_f64());
-
-        let _t1 = std::time::Instant::now();
         let index_defs = ops::load_index_defs(&store)?;
         let constraint_defs = ops::load_constraints(&store)?;
         let mut graph = Self {
@@ -264,12 +260,9 @@ impl Graph {
             _owned_dir: None,
         };
 
-        eprintln!("[open] load_index/constraint_defs {:>6.3}s", _t1.elapsed().as_secs_f64());
-
         // ── Pre-allocate node maps using stored counts ────────────────────────
         let node_hint = graph.store.node_count().unwrap_or(0) as usize;
         let edge_hint = graph.store.edge_count().unwrap_or(0) as usize;
-        eprintln!("[open] counts: {} nodes, {} edges", node_hint, edge_hint);
         graph.nodes   = HashMap::with_capacity(node_hint);
         graph.adj_out = HashMap::with_capacity(node_hint);
         graph.adj_in  = HashMap::with_capacity(node_hint);
@@ -285,7 +278,6 @@ impl Graph {
         }
 
         // ── Pass 1+2: stream nodes → label_index + prop_index in one pass ─────
-        let _tp1 = std::time::Instant::now();
         {
             let store = &graph.store;
             let nodes = &mut graph.nodes;
@@ -324,8 +316,6 @@ impl Graph {
             })?;
         }
 
-        eprintln!("[open] pass1+2 nodes           {:>8.3}s", _tp1.elapsed().as_secs_f64());
-
         // ── Pass 3: build adj from compact adj CFs (no full Edge deserialize) ──
         //
         // adj_out CF entries are ~60 bytes each vs ~200-500 bytes for a full
@@ -335,7 +325,6 @@ impl Graph {
         // adj_in by scanning the corresponding CF directly.
         let avg_deg = (edge_hint / node_hint.max(1)).max(1);
 
-        let _tp3a = std::time::Instant::now();
         // Process adj_out and adj_in inline via field-level borrows.
         //
         // The previous approach collected all E entries into two
@@ -369,8 +358,6 @@ impl Graph {
                 Ok(())
             })?;
         }
-        eprintln!("[open] pass3a adj_out          {:>8.3}s", _tp3a.elapsed().as_secs_f64());
-        let _tp3b = std::time::Instant::now();
         {
             let store  = &graph.store;
             let adj_in = &mut graph.adj_in;
@@ -393,28 +380,33 @@ impl Graph {
             })?;
         }
 
-        eprintln!("[open] pass3b adj_in           {:>8.3}s", _tp3b.elapsed().as_secs_f64());
-
         // ── Pass 4: build edge_label_index from compact edge_label_idx CF ──────
-        let _tp4 = std::time::Instant::now();
+        //
+        // Collect EdgeIds into Vecs first, then convert to HashSets with exact
+        // pre-known capacity.  Building HashSets incrementally causes ~25
+        // resize+rehash cycles per label as each set grows from 0 to millions
+        // of entries.  Vec::push is O(1) with no hashing; converting at the end
+        // with HashSet::with_capacity avoids all intermediate resizes.
         {
             let store = &graph.store;
             let eli   = &mut graph.edge_label_index;
-            // Avoid label.to_owned() on every iteration (E times) when the
-            // label key already exists.  Only unique labels allocate a String.
+            let mut raw: HashMap<String, Vec<EdgeId>> = HashMap::new();
             store.for_each_edge_label_idx(|label, edge_id| {
-                if let Some(set) = eli.get_mut(label) {
-                    set.insert(EdgeId(edge_id));
+                if let Some(v) = raw.get_mut(label) {
+                    v.push(EdgeId(edge_id));
                 } else {
-                    let mut set = HashSet::new();
-                    set.insert(EdgeId(edge_id));
-                    eli.insert(label.to_owned(), set);
+                    raw.insert(label.to_owned(), vec![EdgeId(edge_id)]);
                 }
                 Ok(())
             })?;
+            for (label, ids) in raw {
+                let mut set = HashSet::with_capacity(ids.len());
+                for id in ids {
+                    set.insert(id);
+                }
+                eli.insert(label, set);
+            }
         }
-
-        eprintln!("[open] pass4 edge_label_index  {:>8.3}s", _tp4.elapsed().as_secs_f64());
 
         // graph.edges is intentionally left EMPTY on startup.  Edges are
         // fetched lazily from RocksDB by get_edge() as queries access them,
@@ -426,7 +418,6 @@ impl Graph {
         //
         // Edge prop indexes are rare on large graphs.  When they exist, fetch
         // only the edges that belong to the indexed labels.
-        let _tp5 = std::time::Instant::now();
         let edge_prop_labels: Vec<(String, String)> = graph.index_defs.iter()
             .filter(|d| d.target == IndexTarget::Edge)
             .map(|d| (d.label.clone(), d.property.clone()))
@@ -460,11 +451,8 @@ impl Graph {
             }
         }
 
-        eprintln!("[open] edge_prop_index rebuild  {:>7.3}s", _tp5.elapsed().as_secs_f64());
-
         // Migration R6: one-time population of edge_label_idx CF for databases
         // that predate that index.  For new databases the CF is already current.
-        let _tp6 = std::time::Instant::now();
         if graph.store.get_meta(crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT)?.is_none() {
             // edge_label_index is currently empty (CF was empty on pre-R6 DB).
             // Scan the full edges CF once to rebuild it.
@@ -488,8 +476,6 @@ impl Graph {
             graph.store.write(batch)?;
         }
 
-        eprintln!("[open] R6 migration            {:>8.3}s", _tp6.elapsed().as_secs_f64());
-        eprintln!("[open] total                   {:>8.3}s", _t0.elapsed().as_secs_f64());
         Ok(graph)
     }
 

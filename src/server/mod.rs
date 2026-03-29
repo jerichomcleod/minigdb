@@ -73,6 +73,7 @@
 pub mod auth;
 #[cfg(feature = "gui")]
 pub mod http;
+pub mod locations;
 pub mod protocol;
 pub mod registry;
 
@@ -91,12 +92,16 @@ use registry::{GraphRegistry, GraphState};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Bind on `addr` and serve all named graphs under `graphs_dir` indefinitely.
+/// Bind on `addr` and serve all named graphs indefinitely.
 ///
 /// # Arguments
 /// - `config` — server configuration including auth settings and user list.
-/// - `graphs_dir` — filesystem root under which per-graph subdirectories live.
-///   Each graph's RocksDB data is stored at `<graphs_dir>/<name>/`.
+/// - `data_root` — server data directory (e.g. `~/.local/share/minigdb`).
+///   The primary graph root is `<data_root>/graphs/`.  Extra roots are loaded
+///   from `<data_root>/locations.toml` and can be modified at runtime via
+///   admin commands.
+/// - `session_roots` — additional graph-root directories for this process
+///   lifetime only (e.g. from `--graphs-dir` on the CLI).  Not persisted.
 /// - `addr` — TCP address to listen on (e.g. `127.0.0.1:7474`).
 /// - `gui_addr` — if `Some`, also starts the HTTP GUI server on that address.
 ///   Requires the `gui` Cargo feature; if the feature is disabled this
@@ -113,11 +118,14 @@ use registry::{GraphRegistry, GraphState};
 /// This function never returns under normal operation.
 pub async fn serve(
     config: ServerConfig,
-    graphs_dir: PathBuf,
+    data_root: PathBuf,
+    session_roots: Vec<PathBuf>,
     addr: SocketAddr,
     gui_addr: Option<SocketAddr>,
 ) -> std::io::Result<()> {
-    let registry = GraphRegistry::new(graphs_dir);
+    std::fs::create_dir_all(data_root.join("graphs"))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let registry = GraphRegistry::new(data_root, session_roots);
     let listener = TcpListener::bind(addr).await?;
     eprintln!("minigdb listening on {addr}  (Ctrl-C to stop)");
 
@@ -398,12 +406,15 @@ async fn dispatch_line<W: AsyncWriteExt + Unpin>(
 /// - `Admin` — one of the admin sub-commands described below.
 ///
 /// # Admin sub-commands
-/// | `cmd`     | `name` required? | Description                              |
-/// |-----------|-----------------|------------------------------------------|
-/// | `graphs`  | no              | List all open graphs in the registry.    |
-/// | `stats`   | no              | Alias for `graphs`; returns `open_graphs`.|
-/// | `create`  | yes             | Create a new named graph on disk.        |
-/// | `drop`    | yes             | Delete a named graph from disk.          |
+/// | `cmd`            | args           | Description                               |
+/// |------------------|----------------|-------------------------------------------|
+/// | `graphs`         | —              | List all user-visible graph names.        |
+/// | `stats`          | —              | Alias for `graphs`; returns `open_graphs`.|
+/// | `create`         | `name`         | Create a new named graph on disk.         |
+/// | `drop`           | `name`         | Delete a named graph from disk.           |
+/// | `locations`      | —              | List all registered graph-root dirs.      |
+/// | `add_location`   | `path`         | Register an extra root directory.         |
+/// | `remove_location`| `path`         | Unregister an extra root directory.       |
 ///
 /// Unknown commands return [`ServerMessage::AdminFail`].
 async fn handle_client_message<W: AsyncWriteExt + Unpin>(
@@ -421,7 +432,7 @@ async fn handle_client_message<W: AsyncWriteExt + Unpin>(
             })
             .await
         }
-        ClientMessage::Admin { cmd, name } => match cmd.as_str() {
+        ClientMessage::Admin { cmd, name, path } => match cmd.as_str() {
             "graphs" => {
                 let graphs = registry.list().await;
                 send_msg(
@@ -502,6 +513,59 @@ async fn handle_client_message<W: AsyncWriteExt + Unpin>(
                         .await
                     }
                 },
+            },
+            "locations" => {
+                let locs = registry.list_locations().await;
+                let arr: Vec<serde_json::Value> = locs
+                    .into_iter()
+                    .map(|(p, primary)| serde_json::json!({
+                        "path": p.to_string_lossy(),
+                        "primary": primary,
+                    }))
+                    .collect();
+                send_msg(
+                    write,
+                    &ServerMessage::AdminOk {
+                        data: serde_json::json!({ "locations": arr }),
+                    },
+                )
+                .await
+            }
+            "add_location" => match path.as_deref() {
+                None => {
+                    send_msg(write, &ServerMessage::AdminFail {
+                        error: "add_location requires 'path'".to_string(),
+                    })
+                    .await
+                }
+                Some(p) => {
+                    match registry.add_location(std::path::PathBuf::from(p)).await {
+                        Ok(()) => send_msg(write, &ServerMessage::AdminOk {
+                            data: serde_json::json!({}),
+                        }).await,
+                        Err(e) => send_msg(write, &ServerMessage::AdminFail {
+                            error: e.to_string(),
+                        }).await,
+                    }
+                }
+            },
+            "remove_location" => match path.as_deref() {
+                None => {
+                    send_msg(write, &ServerMessage::AdminFail {
+                        error: "remove_location requires 'path'".to_string(),
+                    })
+                    .await
+                }
+                Some(p) => {
+                    match registry.remove_location(std::path::Path::new(p)).await {
+                        Ok(()) => send_msg(write, &ServerMessage::AdminOk {
+                            data: serde_json::json!({}),
+                        }).await,
+                        Err(e) => send_msg(write, &ServerMessage::AdminFail {
+                            error: e.to_string(),
+                        }).await,
+                    }
+                }
             },
             other => {
                 send_msg(
@@ -749,7 +813,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let graphs_dir = tempfile::tempdir().unwrap().into_path();
+        let data_root = tempfile::tempdir().unwrap().into_path();
         let config = ServerConfig {
             server: auth::ServerSection { auth_required: false },
             users: vec![],
@@ -760,7 +824,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(serve(config, graphs_dir, addr, None))
+                .block_on(serve(config, data_root, vec![], addr, None))
                 .unwrap();
         });
 
@@ -774,7 +838,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let graphs_dir = tempfile::tempdir().unwrap().into_path();
+        let data_root = tempfile::tempdir().unwrap().into_path();
         let config = ServerConfig {
             server: auth::ServerSection { auth_required: true },
             users,
@@ -785,7 +849,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(serve(config, graphs_dir, addr, None))
+                .block_on(serve(config, data_root, vec![], addr, None))
                 .unwrap();
         });
 
@@ -1335,7 +1399,7 @@ mod tests {
         let http_addr = http_l.local_addr().unwrap();
         drop(http_l);
 
-        let graphs_dir = tempfile::tempdir().unwrap().into_path();
+        let data_root = tempfile::tempdir().unwrap().into_path();
         let config = ServerConfig {
             server: auth::ServerSection { auth_required: false },
             users: vec![],
@@ -1346,7 +1410,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(serve(config, graphs_dir, tcp_addr, Some(http_addr)))
+                .block_on(serve(config, data_root, vec![], tcp_addr, Some(http_addr)))
                 .unwrap();
         });
 

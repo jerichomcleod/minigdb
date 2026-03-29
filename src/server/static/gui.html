@@ -91,14 +91,27 @@ tr:hover td{background:#161b22}
 /* custom modal */
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:300}
 #modal.show{display:flex}
-#modal-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:22px 24px;min-width:260px;max-width:400px}
-#modal-msg{color:#c9d1d9;font-size:13px;margin-bottom:16px;line-height:1.5;white-space:pre-line}
+#modal-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:22px 24px;min-width:260px;max-width:min(600px,90vw)}
+#modal-msg{color:#c9d1d9;font-size:13px;margin-bottom:16px;line-height:1.5;white-space:pre-line;word-break:break-all}
 #modal-btns{display:flex;gap:8px;justify-content:flex-end}
 /* saved views modal */
 #views-modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:200}
 #views-modal.show{display:flex}
 #views-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:22px 24px;min-width:340px;max-width:500px;width:90%;display:flex;flex-direction:column;max-height:70vh}
 #views-box h3{color:#58a6ff;font-size:13px;margin-bottom:14px;letter-spacing:.5px}
+/* locations modal */
+#loc-modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:200}
+#loc-modal.show{display:flex}
+#loc-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:22px 24px;min-width:360px;max-width:520px;width:90%;display:flex;flex-direction:column;max-height:70vh}
+#loc-box h3{color:#58a6ff;font-size:13px;margin-bottom:14px;letter-spacing:.5px}
+#loc-list{overflow-y:auto;flex:1;margin-bottom:12px}
+.loc-entry{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #21262d;font-size:12px;color:#c9d1d9;word-break:break-all}
+.loc-entry .loc-badge{font-size:10px;color:#58a6ff;background:#0d419d;border-radius:3px;padding:1px 5px;flex-shrink:0}
+.loc-entry .loc-path{flex:1}
+.loc-entry button.danger{flex-shrink:0;padding:2px 8px;font-size:11px}
+#loc-add{display:flex;gap:6px;margin-bottom:12px}
+#loc-add input{flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:5px 8px;font-size:12px}
+#loc-footer{display:flex;justify-content:flex-end}
 #views-list{overflow-y:auto;flex:1;margin-bottom:14px;min-height:40px}
 .view-row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #21262d}
 .view-row:last-child{border-bottom:none}
@@ -136,6 +149,21 @@ tr:hover td{background:#161b22}
   </div>
 </div>
 
+<!-- Locations modal -->
+<div id="loc-modal">
+  <div id="loc-box">
+    <h3>GRAPH LOCATIONS</h3>
+    <div id="loc-list"></div>
+    <div id="loc-add">
+      <input id="loc-input" placeholder="Absolute path to graph directory…" autocomplete="off">
+      <button onclick="addLocation()">Add</button>
+    </div>
+    <div id="loc-footer">
+      <button onclick="closeLocModal()">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- Login overlay -->
 <div id="overlay" style="display:none">
   <div id="login">
@@ -153,6 +181,7 @@ tr:hover td{background:#161b22}
   <select id="gsel" onchange="switchGraph(this.value)" title="Active graph"></select>
   <button onclick="newGraph()">+ Graph</button>
   <button onclick="dropGraph()" class="danger">✕ Drop</button>
+  <button onclick="openLocModal()" title="Manage graph-root directories">⊞ Locations</button>
   <span id="status"></span>
 </div>
 
@@ -1124,6 +1153,60 @@ async function deleteView(name) {
 // Close views modal when clicking the backdrop.
 document.getElementById('views-modal').addEventListener('click', e => {
   if (e.target === document.getElementById('views-modal')) closeViewsModal();
+});
+
+// ── Locations modal ────────────────────────────────────────────────────────────
+
+async function openLocModal() {
+  await refreshLocList();
+  document.getElementById('loc-input').value = '';
+  document.getElementById('loc-modal').classList.add('show');
+}
+
+function closeLocModal() {
+  document.getElementById('loc-modal').classList.remove('show');
+}
+
+async function refreshLocList() {
+  const r = await api('/api/locations');
+  const list = document.getElementById('loc-list');
+  if (!r || !r.locations) { list.innerHTML = '<div style="color:#8b949e;font-size:12px">Failed to load locations.</div>'; return; }
+  if (r.locations.length === 0) { list.innerHTML = '<div style="color:#8b949e;font-size:12px">(none)</div>'; return; }
+  list.innerHTML = r.locations.map(loc => {
+    const badge = loc.primary ? '<span class="loc-badge">primary</span>' : '';
+    const del = loc.primary ? '' : `<button class="danger" onclick="removeLocation(${JSON.stringify(loc.path).replace(/"/g,'&quot;')})">✕</button>`;
+    return `<div class="loc-entry">${badge}<span class="loc-path">${esc(loc.path)}</span>${del}</div>`;
+  }).join('');
+}
+
+async function addLocation() {
+  const path = document.getElementById('loc-input').value.trim();
+  if (!path) return;
+  const r = await api('/api/locations', { method: 'POST', body: JSON.stringify({ path }) });
+  if (!r) return;
+  if (r.error) { alert('Error: ' + r.error); return; }
+  document.getElementById('loc-input').value = '';
+  await refreshLocList();
+  await loadGraphs();
+}
+
+async function removeLocation(path) {
+  const ok = await customConfirm(`Remove location:\n${path}\n\nGraphs in this directory will no longer be visible.`);
+  if (!ok) return;
+  const encoded = encodeURIComponent(path);
+  const r = await api('/api/locations/' + encoded, { method: 'DELETE' });
+  if (!r) return;
+  if (r.error) { alert('Error: ' + r.error); return; }
+  await refreshLocList();
+  await loadGraphs();
+}
+
+document.getElementById('loc-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('loc-modal')) closeLocModal();
+});
+
+document.getElementById('loc-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') addLocation();
 });
 
 init();

@@ -234,7 +234,11 @@ impl Graph {
     /// Performs a full load of all nodes, edges, and indexes from RocksDB into
     /// RAM (ARCH-2).  After `open()` returns, all reads are pure in-memory.
     pub fn open(path: &Path) -> Result<Self, DbError> {
+        let _t0 = std::time::Instant::now();
         let store = RocksStore::open(path)?;
+        eprintln!("[open] RocksStore::open        {:>8.3}s", _t0.elapsed().as_secs_f64());
+
+        let _t1 = std::time::Instant::now();
         let index_defs = ops::load_index_defs(&store)?;
         let constraint_defs = ops::load_constraints(&store)?;
         let mut graph = Self {
@@ -260,9 +264,12 @@ impl Graph {
             _owned_dir: None,
         };
 
+        eprintln!("[open] load_index/constraint_defs {:>6.3}s", _t1.elapsed().as_secs_f64());
+
         // ── Pre-allocate node maps using stored counts ────────────────────────
         let node_hint = graph.store.node_count().unwrap_or(0) as usize;
         let edge_hint = graph.store.edge_count().unwrap_or(0) as usize;
+        eprintln!("[open] counts: {} nodes, {} edges", node_hint, edge_hint);
         graph.nodes   = HashMap::with_capacity(node_hint);
         graph.adj_out = HashMap::with_capacity(node_hint);
         graph.adj_in  = HashMap::with_capacity(node_hint);
@@ -278,20 +285,35 @@ impl Graph {
         }
 
         // ── Pass 1+2: stream nodes → label_index + prop_index in one pass ─────
+        let _tp1 = std::time::Instant::now();
         {
             let store = &graph.store;
             let nodes = &mut graph.nodes;
             let li    = &mut graph.label_index;
             let pi    = &mut graph.prop_index;
+            // Avoid cloning the label string on every entry when the key already
+            // exists — li.entry(label.clone()) always allocates.  For N nodes
+            // with L labels each this saves N*L String allocations.
+            // Skip the property inner-loop entirely when no prop indexes are
+            // declared (the common case); avoids N*L*P clone+lookup iterations.
+            let has_prop_index = !pi.is_empty();
             store.for_each_node_raw(|data| {
                 if let Ok(node) = bincode::deserialize::<Node>(data) {
                     for label in &node.labels {
-                        li.entry(label.clone()).or_default().insert(node.id);
-                        for (prop, val) in &node.properties {
-                            let k = (label.clone(), prop.clone());
-                            if let Some(btree) = pi.get_mut(&k) {
-                                if let Some(enc) = crate::types::value_index_key(val) {
-                                    btree.entry(enc).or_default().insert(node.id);
+                        if let Some(set) = li.get_mut(label.as_str()) {
+                            set.insert(node.id);
+                        } else {
+                            let mut set = HashSet::new();
+                            set.insert(node.id);
+                            li.insert(label.clone(), set);
+                        }
+                        if has_prop_index {
+                            for (prop, val) in &node.properties {
+                                let k = (label.clone(), prop.clone());
+                                if let Some(btree) = pi.get_mut(&k) {
+                                    if let Some(enc) = crate::types::value_index_key(val) {
+                                        btree.entry(enc).or_default().insert(node.id);
+                                    }
                                 }
                             }
                         }
@@ -302,6 +324,8 @@ impl Graph {
             })?;
         }
 
+        eprintln!("[open] pass1+2 nodes           {:>8.3}s", _tp1.elapsed().as_secs_f64());
+
         // ── Pass 3: build adj from compact adj CFs (no full Edge deserialize) ──
         //
         // adj_out CF entries are ~60 bytes each vs ~200-500 bytes for a full
@@ -311,45 +335,86 @@ impl Graph {
         // adj_in by scanning the corresponding CF directly.
         let avg_deg = (edge_hint / node_hint.max(1)).max(1);
 
-        // Collect into owned Vecs inside a block so the store borrow ends
-        // before we call `intern_adj_label` (which needs `&mut graph`).
-        let (adj_out_raw, adj_in_raw) = {
-            let store = &graph.store;
-            let mut aor: Vec<(u128, u128, u128, String)> = Vec::with_capacity(edge_hint);
-            let mut air: Vec<(u128, u128, u128, String)> = Vec::with_capacity(edge_hint);
-            store.for_each_adj_out(|from, edge_id, to, label| {
-                aor.push((from, edge_id, to, label.to_owned())); Ok(())
-            })?;
-            store.for_each_adj_in(|to, edge_id, from, label| {
-                air.push((to, edge_id, from, label.to_owned())); Ok(())
-            })?;
-            (aor, air)
-        };
-
-        for (from, eid, to, label) in adj_out_raw {
-            let lid = graph.intern_adj_label(&label);
-            graph.adj_out
-                .entry(NodeId(from))
-                .or_insert_with(|| Vec::with_capacity(avg_deg))
-                .push(AdjEntry { edge_id: EdgeId(eid), neighbor: NodeId(to), label_id: lid });
-        }
-        for (to, eid, from, label) in adj_in_raw {
-            let lid = graph.intern_adj_label(&label);
-            graph.adj_in
-                .entry(NodeId(to))
-                .or_insert_with(|| Vec::with_capacity(avg_deg))
-                .push(AdjEntry { edge_id: EdgeId(eid), neighbor: NodeId(from), label_id: lid });
-        }
-
-        // ── Pass 4: build edge_label_index from compact edge_label_idx CF ──────
+        let _tp3a = std::time::Instant::now();
+        // Process adj_out and adj_in inline via field-level borrows.
+        //
+        // The previous approach collected all E entries into two
+        // Vec<(u128,u128,u128,String)> (each pre-allocated with Vec::with_capacity(E)),
+        // then iterated them again to intern labels.  For 40M edges that means
+        // ~6 GiB of transient Vec capacity plus 80M label.to_owned() allocations —
+        // all discarded immediately after processing.
+        //
+        // Rust allows simultaneous borrows of disjoint struct fields, so we can
+        // borrow `store` immutably while holding `&mut adj_out/adj_in/adj_label_*`.
+        // Label interning is inlined: only unique labels (typically ≪ edge count)
+        // ever allocate a String.
         {
-            let store = &graph.store;
-            let eli   = &mut graph.edge_label_index;
-            store.for_each_edge_label_idx(|label, edge_id| {
-                eli.entry(label.to_owned()).or_default().insert(EdgeId(edge_id));
+            let store   = &graph.store;
+            let adj_out = &mut graph.adj_out;
+            let alt     = &mut graph.adj_label_to_id;
+            let ali     = &mut graph.adj_id_to_label;
+            store.for_each_adj_out(|from, edge_id, to, label| {
+                let lid = if let Some(&id) = alt.get(label) {
+                    id
+                } else {
+                    let id = ali.len() as u32;
+                    ali.push(label.to_owned());
+                    alt.insert(label.to_owned(), id);
+                    id
+                };
+                adj_out
+                    .entry(NodeId(from))
+                    .or_insert_with(|| Vec::with_capacity(avg_deg))
+                    .push(AdjEntry { edge_id: EdgeId(edge_id), neighbor: NodeId(to), label_id: lid });
                 Ok(())
             })?;
         }
+        eprintln!("[open] pass3a adj_out          {:>8.3}s", _tp3a.elapsed().as_secs_f64());
+        let _tp3b = std::time::Instant::now();
+        {
+            let store  = &graph.store;
+            let adj_in = &mut graph.adj_in;
+            let alt    = &mut graph.adj_label_to_id;
+            let ali    = &mut graph.adj_id_to_label;
+            store.for_each_adj_in(|to, edge_id, from, label| {
+                let lid = if let Some(&id) = alt.get(label) {
+                    id
+                } else {
+                    let id = ali.len() as u32;
+                    ali.push(label.to_owned());
+                    alt.insert(label.to_owned(), id);
+                    id
+                };
+                adj_in
+                    .entry(NodeId(to))
+                    .or_insert_with(|| Vec::with_capacity(avg_deg))
+                    .push(AdjEntry { edge_id: EdgeId(edge_id), neighbor: NodeId(from), label_id: lid });
+                Ok(())
+            })?;
+        }
+
+        eprintln!("[open] pass3b adj_in           {:>8.3}s", _tp3b.elapsed().as_secs_f64());
+
+        // ── Pass 4: build edge_label_index from compact edge_label_idx CF ──────
+        let _tp4 = std::time::Instant::now();
+        {
+            let store = &graph.store;
+            let eli   = &mut graph.edge_label_index;
+            // Avoid label.to_owned() on every iteration (E times) when the
+            // label key already exists.  Only unique labels allocate a String.
+            store.for_each_edge_label_idx(|label, edge_id| {
+                if let Some(set) = eli.get_mut(label) {
+                    set.insert(EdgeId(edge_id));
+                } else {
+                    let mut set = HashSet::new();
+                    set.insert(EdgeId(edge_id));
+                    eli.insert(label.to_owned(), set);
+                }
+                Ok(())
+            })?;
+        }
+
+        eprintln!("[open] pass4 edge_label_index  {:>8.3}s", _tp4.elapsed().as_secs_f64());
 
         // graph.edges is intentionally left EMPTY on startup.  Edges are
         // fetched lazily from RocksDB by get_edge() as queries access them,
@@ -361,6 +426,7 @@ impl Graph {
         //
         // Edge prop indexes are rare on large graphs.  When they exist, fetch
         // only the edges that belong to the indexed labels.
+        let _tp5 = std::time::Instant::now();
         let edge_prop_labels: Vec<(String, String)> = graph.index_defs.iter()
             .filter(|d| d.target == IndexTarget::Edge)
             .map(|d| (d.label.clone(), d.property.clone()))
@@ -394,8 +460,11 @@ impl Graph {
             }
         }
 
+        eprintln!("[open] edge_prop_index rebuild  {:>7.3}s", _tp5.elapsed().as_secs_f64());
+
         // Migration R6: one-time population of edge_label_idx CF for databases
         // that predate that index.  For new databases the CF is already current.
+        let _tp6 = std::time::Instant::now();
         if graph.store.get_meta(crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT)?.is_none() {
             // edge_label_index is currently empty (CF was empty on pre-R6 DB).
             // Scan the full edges CF once to rebuild it.
@@ -419,6 +488,8 @@ impl Graph {
             graph.store.write(batch)?;
         }
 
+        eprintln!("[open] R6 migration            {:>8.3}s", _tp6.elapsed().as_secs_f64());
+        eprintln!("[open] total                   {:>8.3}s", _t0.elapsed().as_secs_f64());
         Ok(graph)
     }
 

@@ -44,7 +44,9 @@ pub enum Operation {
     /// Delete an edge by ID.
     DeleteEdge { edge_id: EdgeId },
     /// Declare a property index on `(label, property)`.
-    CreateIndex { label: String, property: String },
+    /// `target` is stored explicitly so WAL replay uses the persisted value
+    /// instead of the heuristic in `apply_create_index` (MED-9).
+    CreateIndex { label: String, property: String, target: crate::graph::IndexTarget },
     /// Remove a property index for `(label, property)`.
     DropIndex { label: String, property: String },
 }

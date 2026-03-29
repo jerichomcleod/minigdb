@@ -11,6 +11,41 @@ use crate::types::{value_index_key, DbError, Edge, EdgeId, Node, NodeId, Value};
 
 use super::Graph;
 
+// ── Property value validation ─────────────────────────────────────────────────
+
+/// Reject string property values that contain NUL bytes (`\0`).
+///
+/// Property index keys use `\0` as a field separator
+/// (`label\0prop\0S:value\0node_id`).  A NUL byte inside the value string
+/// would split the key at the wrong position, silently corrupting the index.
+fn check_value_safe(key: &str, value: &Value) -> Result<(), DbError> {
+    if let Value::String(s) = value {
+        if s.contains('\0') {
+            return Err(DbError::Query(format!(
+                "property '{}': string values may not contain NUL bytes", key
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ── Lazy edge cache helper ────────────────────────────────────────────────────
+
+/// Ensure `edge_id` is present in `graph.edges`, loading it from RocksDB if
+/// necessary.  Called at the top of every edge mutation function so that
+/// pre-existing edges (not yet cached after lazy open) can be mutated.
+fn load_edge_if_missing(graph: &mut Graph, edge_id: EdgeId) -> Result<(), DbError> {
+    if graph.edges.contains_key(&edge_id) {
+        return Ok(());
+    }
+    if let Ok(Some(data)) = graph.store.get_edge_raw(edge_id.0) {
+        if let Ok(edge) = bincode::deserialize::<Edge>(&data) {
+            graph.edges.insert(edge_id, edge);
+        }
+    }
+    Ok(())
+}
+
 const META_INDEX_DEFS: &[u8] = b"index_defs";
 const META_CONSTRAINT_DEFS: &[u8] = b"constraint_defs";
 
@@ -85,16 +120,8 @@ fn encode_node(node: &Node) -> Result<Vec<u8>, DbError> {
     bincode::serialize(node).map_err(|e| DbError::Serialization(e.to_string()))
 }
 
-fn decode_node(data: &[u8]) -> Result<Node, DbError> {
-    bincode::deserialize(data).map_err(|e| DbError::Serialization(e.to_string()))
-}
-
 fn encode_edge(edge: &Edge) -> Result<Vec<u8>, DbError> {
     bincode::serialize(edge).map_err(|e| DbError::Serialization(e.to_string()))
-}
-
-fn decode_edge(data: &[u8]) -> Result<Edge, DbError> {
-    bincode::deserialize(data).map_err(|e| DbError::Serialization(e.to_string()))
 }
 
 // ── prop_idx CF + in-memory prop_index maintenance helpers (ARCH-2) ──────────
@@ -320,7 +347,8 @@ pub(crate) fn insert_edge(graph: &mut Graph, edge: Edge) -> Result<(), DbError> 
         return Ok(());
     }
     let data = encode_edge(&edge)?;
-    let new_count = (graph.edges.len() as u64) + 1;
+    // Use the stored meta count — graph.edges may be a partial cache after lazy open.
+    let new_count = graph.store.edge_count().unwrap_or(0) + 1;
     let mut batch = RocksStore::batch();
 
     graph.store.put_edge_batch(&mut batch, edge.id.0, &data);
@@ -365,13 +393,14 @@ pub(crate) fn set_node_property(
     key: String,
     value: Value,
 ) -> Result<(), DbError> {
+    check_value_safe(&key, &value)?;
     let mut node = graph.nodes.get(&node_id).cloned()
         .ok_or(DbError::NodeNotFound(node_id))?;
 
     let old_val = node.properties.get(&key).cloned();
+    // Insert before constraint check so the checker sees the new value.
     node.properties.insert(key.clone(), value.clone());
     check_constraints(graph, &node.labels, &node.properties, Some(node_id.0))?;
-    node.properties.insert(key.clone(), value);
     let new_data = encode_node(&node)?;
 
     let mut batch = RocksStore::batch();
@@ -398,28 +427,27 @@ pub(crate) fn set_node_property(
     Ok(())
 }
 
-/// Set a property on an edge (read from in-memory, write-through to RocksDB).
+/// Set a property on an edge (read from in-memory/RocksDB, write-through).
 pub(crate) fn set_edge_property(
     graph: &mut Graph,
     edge_id: EdgeId,
     key: String,
     value: Value,
 ) -> Result<(), DbError> {
+    check_value_safe(&key, &value)?;
+    load_edge_if_missing(graph, edge_id)?;
     let mut edge = graph.edges.get(&edge_id).cloned()
         .ok_or(DbError::EdgeNotFound(edge_id))?;
 
     let old_val = edge.properties.get(&key).cloned();
-    if let Some(ref old) = old_val {
-        let mut batch = RocksStore::batch();
-        batch_edge_prop_remove_val(graph, &mut batch, &edge.label, &key, old, edge_id.0);
-        graph.store.write(batch)?;
-    }
-
     edge.properties.insert(key.clone(), value.clone());
 
+    // All changes in a single batch to avoid a crash window between two writes.
     let mut batch = RocksStore::batch();
+    if let Some(ref old) = old_val {
+        batch_edge_prop_remove_val(graph, &mut batch, &edge.label, &key, old, edge_id.0);
+    }
     graph.store.put_edge_batch(&mut batch, edge_id.0, &encode_edge(&edge)?);
-    // Add new edge prop index entry.
     let idx_key = (edge.label.clone(), key.clone());
     if graph.edge_prop_index.contains_key(&idx_key) {
         if let Some(encoded) = value_index_key(&value) {
@@ -463,6 +491,7 @@ pub(crate) fn remove_edge_property(
     edge_id: EdgeId,
     key: &str,
 ) -> Result<(), DbError> {
+    load_edge_if_missing(graph, edge_id)?;
     let mut edge = graph.edges.get(&edge_id).cloned()
         .ok_or(DbError::EdgeNotFound(edge_id))?;
 
@@ -610,22 +639,7 @@ pub(crate) fn delete_node_detach(graph: &mut Graph, node_id: NodeId) -> Result<(
     Ok(())
 }
 
-// ── Migration and bulk-write helpers ─────────────────────────────────────────
-
-/// Populate the `edge_label_idx` CF from in-memory edges (ARCH-2 migration).
-/// Called by `Graph::open()` on first open after Phase R6 is introduced.
-pub(crate) fn rebuild_edge_label_idx_from_memory(graph: &mut Graph) -> Result<(), DbError> {
-    let mut batch = RocksStore::batch();
-    for (eid, edge) in &graph.edges {
-        graph.store.put_edge_label_entry(&mut batch, &edge.label, eid.0);
-    }
-    graph.store.put_meta_batch(
-        &mut batch,
-        crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT,
-        b"1",
-    );
-    graph.store.write(batch)
-}
+// ── Bulk-write helpers ────────────────────────────────────────────────────────
 
 /// Write all in-memory nodes and edges to RocksDB in bulk.
 ///
@@ -706,10 +720,11 @@ pub(crate) fn write_all_to_rocksdb(graph: &mut Graph) -> Result<(), DbError> {
 
 /// Delete an edge by ID.
 pub(crate) fn delete_edge(graph: &mut Graph, edge_id: EdgeId) -> Result<(), DbError> {
+    load_edge_if_missing(graph, edge_id)?;
     let edge = graph.edges.get(&edge_id).cloned()
         .ok_or(DbError::EdgeNotFound(edge_id))?;
 
-    let new_count = (graph.edges.len() as u64).saturating_sub(1);
+    let new_count = graph.store.edge_count().unwrap_or(1).saturating_sub(1);
     let mut batch = RocksStore::batch();
     graph.store.delete_edge_batch(&mut batch, edge_id.0);
     graph.store.delete_edge_label_entry(&mut batch, &edge.label, edge_id.0);
@@ -736,4 +751,105 @@ pub(crate) fn delete_edge(graph: &mut Graph, edge_id: EdgeId) -> Result<(), DbEr
     graph.edges.remove(&edge_id);
 
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Properties, Value};
+
+    fn make_node(id: NodeId, labels: &[&str], props: Properties) -> crate::types::Node {
+        crate::types::Node::new(id, labels.iter().map(|s| s.to_string()).collect(), props)
+    }
+
+    // ── NUL byte rejection (HIGH-4) ───────────────────────────────────────────
+
+    /// Setting a node property whose value contains a NUL byte must be rejected.
+    /// NUL is used as a field separator in property-index RocksDB keys; allowing
+    /// it would silently corrupt the index.
+    #[test]
+    fn nul_byte_in_node_property_rejected() {
+        let mut g = Graph::new();
+        let id = g.alloc_node_id();
+        g.apply_insert_node(make_node(id, &["T"], Properties::new()));
+        let bad = Value::String("hello\0world".into());
+        let err = g.apply_set_node_property(id, "x".into(), bad);
+        assert!(err.is_err(), "NUL byte in node property value must be rejected");
+        let msg = format!("{:?}", err.unwrap_err());
+        assert!(msg.contains("NUL"), "error must mention NUL bytes: {msg}");
+    }
+
+    /// Setting an edge property whose value contains a NUL byte must be rejected.
+    #[test]
+    fn nul_byte_in_edge_property_rejected() {
+        let mut g = Graph::new();
+        let a = g.alloc_node_id();
+        let b = g.alloc_node_id();
+        g.apply_insert_node(make_node(a, &[], Properties::new()));
+        g.apply_insert_node(make_node(b, &[], Properties::new()));
+        let eid = g.alloc_edge_id();
+        g.apply_insert_edge(Edge::new(eid, "R".into(), a, b, Properties::new(), true));
+        let bad = Value::String("val\0ue".into());
+        let err = g.apply_set_edge_property(eid, "k".into(), bad);
+        assert!(err.is_err(), "NUL byte in edge property value must be rejected");
+    }
+
+    // ── Lazy-load edge mutations (CRIT-3) ─────────────────────────────────────
+
+    /// `apply_set_edge_property` must work on an edge that was persisted to RocksDB
+    /// in a previous session and not yet loaded into the in-memory cache.
+    #[test]
+    fn set_edge_property_on_lazy_loaded_edge() {
+        let dir = tempfile::tempdir().unwrap().into_path();
+        let eid;
+        // Phase 1: write an edge to disk.
+        {
+            let mut g = Graph::open(&dir).unwrap();
+            let a = g.alloc_node_id();
+            let b = g.alloc_node_id();
+            g.apply_insert_node(make_node(a, &[], Properties::new()));
+            g.apply_insert_node(make_node(b, &[], Properties::new()));
+            eid = g.alloc_edge_id();
+            g.apply_insert_edge(Edge::new(eid, "R".into(), a, b, Properties::new(), true));
+            g.store.flush().unwrap();
+        }
+        // Phase 2: reopen (edge is NOT in cache), then mutate it.
+        {
+            let mut g = Graph::open(&dir).unwrap();
+            assert!(!g.edges.contains_key(&eid), "edge must not be pre-loaded");
+            let result = g.apply_set_edge_property(eid, "w".into(), Value::Int(42));
+            assert!(result.is_ok(), "set_edge_property on lazy-loaded edge must succeed: {result:?}");
+            // Confirm the property was actually set.
+            let edge = g.get_edge(eid).expect("edge must be readable after set");
+            assert_eq!(edge.properties.get("w"), Some(&Value::Int(42)));
+        }
+    }
+
+    /// `apply_delete_edge` must work on an edge persisted in a previous session.
+    #[test]
+    fn delete_edge_on_lazy_loaded_edge() {
+        let dir = tempfile::tempdir().unwrap().into_path();
+        let eid;
+        // Phase 1: write nodes + edge to disk.
+        {
+            let mut g = Graph::open(&dir).unwrap();
+            let a = g.alloc_node_id();
+            let b = g.alloc_node_id();
+            g.apply_insert_node(make_node(a, &[], Properties::new()));
+            g.apply_insert_node(make_node(b, &[], Properties::new()));
+            eid = g.alloc_edge_id();
+            g.apply_insert_edge(Edge::new(eid, "R".into(), a, b, Properties::new(), true));
+            g.store.flush().unwrap();
+        }
+        // Phase 2: reopen and delete the edge.
+        {
+            let mut g = Graph::open(&dir).unwrap();
+            assert!(!g.edges.contains_key(&eid), "edge must not be pre-loaded");
+            let result = g.apply_delete_edge(eid);
+            assert!(result.is_ok(), "delete_edge on lazy-loaded edge must succeed: {result:?}");
+            assert_eq!(g.store.edge_count().unwrap_or(0), 0, "edge count must be 0 after delete");
+        }
+    }
 }

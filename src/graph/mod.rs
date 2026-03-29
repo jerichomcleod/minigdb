@@ -1,11 +1,21 @@
-//! [`Graph`] — the fully in-memory property graph with RocksDB write-through.
+//! [`Graph`] — the in-memory property graph with RocksDB write-through.
 //!
-//! ARCH-2: All nodes, edges, label indexes, and property indexes live in RAM.
-//! RocksDB is a pure write-through persistence layer — every mutation is applied
-//! in-memory first, then written to RocksDB atomically.  On `open()`, the entire
-//! graph is loaded from RocksDB into RAM once; thereafter no query ever reads
-//! from RocksDB.  This eliminates all steady-state RocksDB reads and makes every
-//! graph traversal/lookup a pure in-memory operation.
+//! ## Loading model (ARCH-2)
+//!
+//! All nodes, label indexes, adjacency maps, and property indexes live in RAM.
+//! RocksDB is a write-through persistence layer — every mutation is applied
+//! in-memory first, then written to RocksDB atomically.
+//!
+//! **Edge data** is loaded *lazily*: `open()` builds the adjacency maps and
+//! edge-label index from compact RocksDB column families (fast at startup), but
+//! does not deserialise full `Edge` objects.  An edge is loaded into
+//! `graph.edges` on the first mutation or explicit read that requires it.
+//! `load_all_edges()` / `all_edges()` force a full load when the complete set
+//! is needed (e.g. `begin_transaction()`, graph algorithms via `CALL`).
+//!
+//! The `edges_fully_loaded` flag tracks whether every edge has been loaded into
+//! the in-memory cache; code that needs the full set must check this flag
+//! (or call `load_all_edges()`) before assuming `graph.edges` is complete.
 
 pub(crate) mod ops;
 pub mod constraints;
@@ -36,20 +46,6 @@ pub struct AdjEntry {
     pub neighbor: NodeId,
     /// Interned edge label ID; resolve via `Graph::adj_label_str`.
     pub label_id: u32,
-}
-
-/// A single tracked change to the in-memory adjacency list during a transaction.
-///
-/// Accumulated in `Graph::txn_adj_deltas` while a transaction is active.
-/// On `ROLLBACK`, the list is reversed and each delta is inverted to restore
-/// the pre-transaction adjacency state in O(ops_in_txn) rather than
-/// re-scanning all edges from RocksDB (which is O(all_edges)).
-#[derive(Clone)]
-pub(crate) enum AdjDelta {
-    AddOut  { from: NodeId, entry: AdjEntry },
-    AddIn   { to:   NodeId, entry: AdjEntry },
-    RemoveOut { from: NodeId, entry: AdjEntry },
-    RemoveIn  { to:   NodeId, entry: AdjEntry },
 }
 
 /// Which graph element a property index targets.
@@ -98,14 +94,15 @@ impl Drop for CleanupDir {
 /// in-memory state is restored from this snapshot in O(1) pointer swaps, then
 /// RocksDB is cleared and rewritten from the restored maps.
 struct TransactionSnapshot {
-    nodes:             HashMap<NodeId, Node>,
-    edges:             HashMap<EdgeId, Edge>,
-    label_index:       HashMap<String, HashSet<NodeId>>,
-    edge_label_index:  HashMap<String, HashSet<EdgeId>>,
-    prop_index:        HashMap<(String, String), BTreeMap<String, HashSet<NodeId>>>,
-    edge_prop_index:   HashMap<(String, String), BTreeMap<String, HashSet<EdgeId>>>,
-    index_defs:        Vec<PropertyIndexDef>,
-    constraint_defs:   Vec<constraints::ConstraintDef>,
+    nodes:               HashMap<NodeId, Node>,
+    edges:               HashMap<EdgeId, Edge>,
+    edges_fully_loaded:  bool,
+    label_index:         HashMap<String, HashSet<NodeId>>,
+    edge_label_index:    HashMap<String, HashSet<EdgeId>>,
+    prop_index:          HashMap<(String, String), BTreeMap<String, HashSet<NodeId>>>,
+    edge_prop_index:     HashMap<(String, String), BTreeMap<String, HashSet<EdgeId>>>,
+    index_defs:          Vec<PropertyIndexDef>,
+    constraint_defs:     Vec<constraints::ConstraintDef>,
 }
 
 pub struct Graph {
@@ -153,11 +150,18 @@ pub struct Graph {
     txn_pending_ops: Option<Vec<Operation>>,
     /// Pre-BEGIN snapshot, used to restore state on ROLLBACK.
     txn_snapshot: Option<Box<TransactionSnapshot>>,
+    /// `true` once every edge in the database has been loaded into `self.edges`.
+    ///
+    /// Set to `false` by `open()` (lazy loading) and `true` by `load_all_edges()`.
+    /// Guards the `all_edges()` fast path and ensures `begin_transaction()`
+    /// captures a complete snapshot so `rollback_transaction()` can restore it.
+    pub(crate) edges_fully_loaded: bool,
+
     /// Transient mapping from user-supplied CSV `:ID` strings to their assigned
     /// [`NodeId`]s.  Populated by `LOAD CSV NODES`; consumed by `LOAD CSV EDGES`.
     pub csv_id_map: HashMap<String, NodeId>,
 
-    // ── In-memory adjacency (ARCH-1) ──────────────────────────────────────────
+    // ── In-memory adjacency ───────────────────────────────────────────────────
     //
     // Adjacency lists keep (edge_id, neighbor, label_id) in RAM so that graph
     // traversal is O(degree) RAM access rather than O(degree) RocksDB reads.
@@ -167,20 +171,15 @@ pub struct Graph {
     // Write-through: every `insert_edge`/`delete_edge` in ops.rs updates these
     // maps atomically after the RocksDB write.
     //
-    // Rollback: during a transaction, every adj change is appended to
-    // `txn_adj_deltas`.  On ROLLBACK the delta list is reversed and inverted
-    // (O(ops)), avoiding the O(all_edges) re-scan that a full rebuild would
-    // require.  `suppress_adj` is set during the RocksDB re-insert phase so
-    // that write-through is suppressed while adj is already correct.
+    // Rollback: adj is rebuilt from in-memory edges via `build_adj()` after
+    // the in-memory snapshot is restored.  `suppress_adj` suppresses
+    // write-through during the RocksDB-rewrite phase of rollback.
     pub(crate) adj_out: HashMap<NodeId, Vec<AdjEntry>>,
     pub(crate) adj_in:  HashMap<NodeId, Vec<AdjEntry>>,
     adj_label_to_id: HashMap<String, u32>,
     adj_id_to_label: Vec<String>,
-    /// Accumulated adj changes for the current transaction.
-    /// `None` when no transaction is active.
-    pub(crate) txn_adj_deltas: Option<Vec<AdjDelta>>,
     /// Set to `true` during the RocksDB re-insert phase of ROLLBACK so that
-    /// adj write-through (and delta recording) is suppressed entirely.
+    /// adj write-through is suppressed while adj is being rebuilt.
     pub(crate) suppress_adj: bool,
 
     /// If `Some`, this Graph owns a temp directory deleted on drop.
@@ -223,7 +222,8 @@ impl Graph {
             adj_in:  HashMap::new(),
             adj_label_to_id: HashMap::new(),
             adj_id_to_label: Vec::new(),
-            txn_adj_deltas: None,
+
+            edges_fully_loaded: true,   // fresh graph has nothing to lazy-load
             suppress_adj: false,
             _owned_dir: Some(CleanupDir(dir)),
         }
@@ -254,86 +254,169 @@ impl Graph {
             adj_in:  HashMap::new(),
             adj_label_to_id: HashMap::new(),
             adj_id_to_label: Vec::new(),
-            txn_adj_deltas: None,
+
+            edges_fully_loaded: false,  // edges loaded lazily; see load_all_edges()
             suppress_adj: false,
             _owned_dir: None,
         };
 
-        // ── Pass 1: load all nodes + build label_index ────────────────────────
-        let raw_nodes = graph.store.all_nodes_raw()?;
-        for data in raw_nodes {
-            if let Ok(node) = bincode::deserialize::<Node>(&data) {
-                for label in &node.labels {
-                    graph.label_index
-                        .entry(label.clone())
-                        .or_default()
-                        .insert(node.id);
-                }
-                graph.nodes.insert(node.id, node);
+        // ── Pre-allocate node maps using stored counts ────────────────────────
+        let node_hint = graph.store.node_count().unwrap_or(0) as usize;
+        let edge_hint = graph.store.edge_count().unwrap_or(0) as usize;
+        graph.nodes   = HashMap::with_capacity(node_hint);
+        graph.adj_out = HashMap::with_capacity(node_hint);
+        graph.adj_in  = HashMap::with_capacity(node_hint);
+
+        // ── Seed declared prop_index / edge_prop_index keys ───────────────────
+        for def in &graph.index_defs {
+            match def.target {
+                IndexTarget::Node =>
+                    { graph.prop_index.entry((def.label.clone(), def.property.clone())).or_default(); }
+                IndexTarget::Edge =>
+                    { graph.edge_prop_index.entry((def.label.clone(), def.property.clone())).or_default(); }
             }
         }
 
-        // ── Pass 2: build prop_index from in-memory nodes ─────────────────────
-        for def in &graph.index_defs {
-            if def.target == IndexTarget::Node {
-                graph.prop_index
-                    .entry((def.label.clone(), def.property.clone()))
-                    .or_default();
-            }
+        // ── Pass 1+2: stream nodes → label_index + prop_index in one pass ─────
+        {
+            let store = &graph.store;
+            let nodes = &mut graph.nodes;
+            let li    = &mut graph.label_index;
+            let pi    = &mut graph.prop_index;
+            store.for_each_node_raw(|data| {
+                if let Ok(node) = bincode::deserialize::<Node>(data) {
+                    for label in &node.labels {
+                        li.entry(label.clone()).or_default().insert(node.id);
+                        for (prop, val) in &node.properties {
+                            let k = (label.clone(), prop.clone());
+                            if let Some(btree) = pi.get_mut(&k) {
+                                if let Some(enc) = crate::types::value_index_key(val) {
+                                    btree.entry(enc).or_default().insert(node.id);
+                                }
+                            }
+                        }
+                    }
+                    nodes.insert(node.id, node);
+                }
+                Ok(())
+            })?;
         }
-        for (_, node) in &graph.nodes {
-            for label in &node.labels {
-                for (prop, val) in &node.properties {
-                    let key = (label.clone(), prop.clone());
-                    if let Some(btree) = graph.prop_index.get_mut(&key) {
-                        if let Some(encoded) = crate::types::value_index_key(val) {
-                            btree.entry(encoded).or_default().insert(node.id);
+
+        // ── Pass 3: build adj from compact adj CFs (no full Edge deserialize) ──
+        //
+        // adj_out CF entries are ~60 bytes each vs ~200-500 bytes for a full
+        // serialised Edge.  For large graphs this is the critical startup path.
+        // The directed/undirected split is already encoded: undirected edges
+        // appear in BOTH directions in each adj CF, so we can build adj_out and
+        // adj_in by scanning the corresponding CF directly.
+        let avg_deg = (edge_hint / node_hint.max(1)).max(1);
+
+        // Collect into owned Vecs inside a block so the store borrow ends
+        // before we call `intern_adj_label` (which needs `&mut graph`).
+        let (adj_out_raw, adj_in_raw) = {
+            let store = &graph.store;
+            let mut aor: Vec<(u128, u128, u128, String)> = Vec::with_capacity(edge_hint);
+            let mut air: Vec<(u128, u128, u128, String)> = Vec::with_capacity(edge_hint);
+            store.for_each_adj_out(|from, edge_id, to, label| {
+                aor.push((from, edge_id, to, label.to_owned())); Ok(())
+            })?;
+            store.for_each_adj_in(|to, edge_id, from, label| {
+                air.push((to, edge_id, from, label.to_owned())); Ok(())
+            })?;
+            (aor, air)
+        };
+
+        for (from, eid, to, label) in adj_out_raw {
+            let lid = graph.intern_adj_label(&label);
+            graph.adj_out
+                .entry(NodeId(from))
+                .or_insert_with(|| Vec::with_capacity(avg_deg))
+                .push(AdjEntry { edge_id: EdgeId(eid), neighbor: NodeId(to), label_id: lid });
+        }
+        for (to, eid, from, label) in adj_in_raw {
+            let lid = graph.intern_adj_label(&label);
+            graph.adj_in
+                .entry(NodeId(to))
+                .or_insert_with(|| Vec::with_capacity(avg_deg))
+                .push(AdjEntry { edge_id: EdgeId(eid), neighbor: NodeId(from), label_id: lid });
+        }
+
+        // ── Pass 4: build edge_label_index from compact edge_label_idx CF ──────
+        {
+            let store = &graph.store;
+            let eli   = &mut graph.edge_label_index;
+            store.for_each_edge_label_idx(|label, edge_id| {
+                eli.entry(label.to_owned()).or_default().insert(EdgeId(edge_id));
+                Ok(())
+            })?;
+        }
+
+        // graph.edges is intentionally left EMPTY on startup.  Edges are
+        // fetched lazily from RocksDB by get_edge() as queries access them,
+        // and are written into graph.edges by every write-through mutation.
+        // This avoids the full edges-CF scan (O(E) I/O + deserialization)
+        // that made open() slow for large graphs.
+
+        // ── Edge property index rebuild (only when declared) ──────────────────
+        //
+        // Edge prop indexes are rare on large graphs.  When they exist, fetch
+        // only the edges that belong to the indexed labels.
+        let edge_prop_labels: Vec<(String, String)> = graph.index_defs.iter()
+            .filter(|d| d.target == IndexTarget::Edge)
+            .map(|d| (d.label.clone(), d.property.clone()))
+            .collect();
+        if !edge_prop_labels.is_empty() {
+            for label in graph.edge_label_index.keys().cloned().collect::<Vec<_>>() {
+                let indexed_props: Vec<String> = edge_prop_labels.iter()
+                    .filter(|(l, _)| l == &label)
+                    .map(|(_, p)| p.clone())
+                    .collect();
+                if indexed_props.is_empty() { continue; }
+                let ids: Vec<EdgeId> = graph.edge_label_index
+                    .get(&label).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+                for eid in ids {
+                    if let Ok(Some(data)) = graph.store.get_edge_raw(eid.0) {
+                        if let Ok(edge) = bincode::deserialize::<Edge>(&data) {
+                            for prop in &indexed_props {
+                                if let Some(val) = edge.properties.get(prop) {
+                                    let k = (label.clone(), prop.clone());
+                                    if let Some(btree) = graph.edge_prop_index.get_mut(&k) {
+                                        if let Some(enc) = crate::types::value_index_key(val) {
+                                            btree.entry(enc).or_default().insert(eid);
+                                        }
+                                    }
+                                }
+                            }
+                            graph.edges.insert(eid, edge);
                         }
                     }
                 }
             }
         }
 
-        // ── Pass 3: load all edges + build edge_label_index ──────────────────
-        let raw_edges = graph.store.all_edges_raw()?;
-        for data in raw_edges {
-            if let Ok(edge) = bincode::deserialize::<Edge>(&data) {
-                graph.edge_label_index
-                    .entry(edge.label.clone())
-                    .or_default()
-                    .insert(edge.id);
-                graph.edges.insert(edge.id, edge);
-            }
-        }
-
-        // ── Pass 4: build edge_prop_index from in-memory edges ────────────────
-        for def in &graph.index_defs {
-            if def.target == IndexTarget::Edge {
-                graph.edge_prop_index
-                    .entry((def.label.clone(), def.property.clone()))
-                    .or_default();
-            }
-        }
-        for (_, edge) in &graph.edges {
-            let key = (edge.label.clone(),);  // single label per edge
-            for (prop, val) in &edge.properties {
-                let k = (edge.label.clone(), prop.clone());
-                if let Some(btree) = graph.edge_prop_index.get_mut(&k) {
-                    if let Some(encoded) = crate::types::value_index_key(val) {
-                        btree.entry(encoded).or_default().insert(edge.id);
-                    }
-                }
-            }
-            let _ = key;
-        }
-
-        // ── Pass 5: build adj_out / adj_in from in-memory edges ───────────────
-        graph.build_adj()?;
-
-        // Migration R6: populate edge_label_idx CF for existing databases that
-        // pre-date this index. Needed for durability only; queries use in-memory.
+        // Migration R6: one-time population of edge_label_idx CF for databases
+        // that predate that index.  For new databases the CF is already current.
         if graph.store.get_meta(crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT)?.is_none() {
-            ops::rebuild_edge_label_idx_from_memory(&mut graph)?;
+            // edge_label_index is currently empty (CF was empty on pre-R6 DB).
+            // Scan the full edges CF once to rebuild it.
+            let mut label_ids: Vec<(String, EdgeId)> = Vec::new();
+            graph.store.for_each_edge_raw(|data| {
+                if let Ok(edge) = bincode::deserialize::<Edge>(data) {
+                    label_ids.push((edge.label, edge.id));
+                }
+                Ok(())
+            })?;
+            let mut batch = RocksStore::batch();
+            for (label, eid) in label_ids {
+                graph.store.put_edge_label_entry(&mut batch, &label, eid.0);
+                graph.edge_label_index.entry(label).or_default().insert(eid);
+            }
+            graph.store.put_meta_batch(
+                &mut batch,
+                crate::storage::rocks_store::META_EDGE_LABEL_IDX_BUILT,
+                b"1",
+            );
+            graph.store.write(batch)?;
         }
 
         Ok(graph)
@@ -356,9 +439,23 @@ impl Graph {
         self.nodes.get(&id).cloned()
     }
 
-    /// Look up an edge by ID — O(1) in-memory HashMap lookup (ARCH-2).
+    /// Look up an edge by ID.
+    ///
+    /// Checks the in-memory cache first (populated by write-through mutations
+    /// and edge property index rebuilds on open).  Falls back to a RocksDB
+    /// point-read for edges that have not yet been accessed this session.
+    /// RocksDB's block cache makes repeated reads of the same edge fast.
     pub fn get_edge(&self, id: EdgeId) -> Option<Edge> {
-        self.edges.get(&id).cloned()
+        if let Some(e) = self.edges.get(&id) {
+            return Some(e.clone());
+        }
+        // Lazy load from RocksDB.
+        if let Ok(Some(data)) = self.store.get_edge_raw(id.0) {
+            if let Ok(edge) = bincode::deserialize::<Edge>(&data) {
+                return Some(edge);
+            }
+        }
+        None
     }
 
     /// Number of nodes — O(1) (ARCH-2).
@@ -371,9 +468,9 @@ impl Graph {
         self.label_index.get(label).map_or(0, |s| s.len())
     }
 
-    /// Number of edges — O(1) (ARCH-2).
+    /// Number of edges — O(1) meta lookup (edges not preloaded on open).
     pub fn edge_count(&self) -> usize {
-        self.edges.len()
+        self.store.edge_count().unwrap_or(0) as usize
     }
 
     /// All NodeIds with `label` — O(1) HashSet clone (ARCH-2).
@@ -462,76 +559,58 @@ impl Graph {
         id
     }
 
-    /// Add an entry to the out-adjacency list for `from`.  Called by
-    /// `ops::insert_edge` immediately after the RocksDB write.
+    /// Add an entry to the out-adjacency list for `from`.
     pub(crate) fn adj_add_out(&mut self, from: NodeId, entry: AdjEntry) {
         if self.suppress_adj { return; }
-        if let Some(deltas) = &mut self.txn_adj_deltas {
-            deltas.push(AdjDelta::AddOut { from, entry: entry.clone() });
-        }
         self.adj_out.entry(from).or_default().push(entry);
     }
 
     /// Add an entry to the in-adjacency list for `to`.
     pub(crate) fn adj_add_in(&mut self, to: NodeId, entry: AdjEntry) {
         if self.suppress_adj { return; }
-        if let Some(deltas) = &mut self.txn_adj_deltas {
-            deltas.push(AdjDelta::AddIn { to, entry: entry.clone() });
-        }
         self.adj_in.entry(to).or_default().push(entry);
     }
 
     /// Remove all entries with `edge_id` from the out-adjacency list of `from`.
-    /// Captures removed entries into the transaction delta when active.
     pub(crate) fn adj_remove_out(&mut self, from: NodeId, edge_id: EdgeId) {
         if self.suppress_adj { return; }
         if let Some(v) = self.adj_out.get_mut(&from) {
-            if self.txn_adj_deltas.is_some() {
-                // Capture entries before removing so rollback can restore them.
-                let mut removed = Vec::new();
-                v.retain(|e| {
-                    if e.edge_id == edge_id { removed.push(e.clone()); false } else { true }
-                });
-                if let Some(deltas) = &mut self.txn_adj_deltas {
-                    for entry in removed {
-                        deltas.push(AdjDelta::RemoveOut { from, entry });
-                    }
-                }
-            } else {
-                v.retain(|e| e.edge_id != edge_id);
-            }
+            v.retain(|e| e.edge_id != edge_id);
         }
     }
 
     /// Remove all entries with `edge_id` from the in-adjacency list of `to`.
-    /// Captures removed entries into the transaction delta when active.
     pub(crate) fn adj_remove_in(&mut self, to: NodeId, edge_id: EdgeId) {
         if self.suppress_adj { return; }
         if let Some(v) = self.adj_in.get_mut(&to) {
-            if self.txn_adj_deltas.is_some() {
-                let mut removed = Vec::new();
-                v.retain(|e| {
-                    if e.edge_id == edge_id { removed.push(e.clone()); false } else { true }
-                });
-                if let Some(deltas) = &mut self.txn_adj_deltas {
-                    for entry in removed {
-                        deltas.push(AdjDelta::RemoveIn { to, entry });
-                    }
-                }
-            } else {
-                v.retain(|e| e.edge_id != edge_id);
-            }
+            v.retain(|e| e.edge_id != edge_id);
         }
     }
 
-    /// Build `adj_out` and `adj_in` from the in-memory `edges` map (ARCH-2).
+    /// Load every edge from RocksDB into `self.edges` if not already done.
     ///
-    /// Called once in `Graph::open()` after all edges are loaded.  All
-    /// subsequent adjacency mutations are write-through.
-    pub(crate) fn build_adj(&mut self) -> Result<(), DbError> {
-        if self.edges.is_empty() {
+    /// Called by `begin_transaction()` so the snapshot captured at BEGIN is
+    /// complete — a prerequisite for `rollback_transaction()` to restore the
+    /// correct state via `write_all_to_rocksdb`.
+    pub(crate) fn load_all_edges(&mut self) -> Result<(), DbError> {
+        if self.edges_fully_loaded {
             return Ok(());
         }
+        self.store.for_each_edge_raw(|data| {
+            if let Ok(edge) = bincode::deserialize::<Edge>(data) {
+                self.edges.entry(edge.id).or_insert(edge);
+            }
+            Ok(())
+        })?;
+        self.edges_fully_loaded = true;
+        Ok(())
+    }
+
+    /// Build `adj_out` and `adj_in` from the in-memory `edges` map.
+    ///
+    /// Only called during rollback (after snapshot restore), where edges are
+    /// guaranteed to be fully loaded.  Steady-state adjacency is write-through.
+    pub(crate) fn build_adj(&mut self) -> Result<(), DbError> {
         let n = self.edges.len();
         let node_count = self.nodes.len().max(1);
         let avg_degree = (n / node_count).max(1);
@@ -574,9 +653,24 @@ impl Graph {
         self.nodes.values().cloned().collect()
     }
 
-    /// All edges — O(E) clone from in-memory map (ARCH-2).
+    /// All edges.
+    ///
+    /// When every edge is in the in-memory cache (`edges_fully_loaded`) the
+    /// result is served from RAM.  Otherwise falls back to a full RocksDB scan
+    /// so that `MATCH ()-[e]->()` patterns with no label filter are correct
+    /// even on a freshly-opened database where the cache is partial.
     pub fn all_edges(&self) -> Vec<Edge> {
-        self.edges.values().cloned().collect()
+        if self.edges_fully_loaded {
+            return self.edges.values().cloned().collect();
+        }
+        let mut out = Vec::new();
+        let _ = self.store.for_each_edge_raw(|data| {
+            if let Ok(e) = bincode::deserialize::<Edge>(data) {
+                out.push(e);
+            }
+            Ok(())
+        });
+        out
     }
 
     // ── Property index API ───────────────────────────────────────────────────
@@ -947,18 +1041,22 @@ impl Graph {
         if self.txn_pending_ops.is_some() {
             return Err(DbError::Query("transaction already active".into()));
         }
+        // Ensure the snapshot captures the complete edge set.  Without this,
+        // rollback_transaction would restore an empty edges map, and the
+        // subsequent clear_all + write_all_to_rocksdb would erase all edges.
+        self.load_all_edges()?;
         self.txn_snapshot = Some(Box::new(TransactionSnapshot {
-            nodes:            self.nodes.clone(),
-            edges:            self.edges.clone(),
-            label_index:      self.label_index.clone(),
-            edge_label_index: self.edge_label_index.clone(),
-            prop_index:       self.prop_index.clone(),
-            edge_prop_index:  self.edge_prop_index.clone(),
-            index_defs:       self.index_defs.clone(),
-            constraint_defs:  self.constraint_defs.clone(),
+            nodes:               self.nodes.clone(),
+            edges:               self.edges.clone(),
+            edges_fully_loaded:  self.edges_fully_loaded,
+            label_index:         self.label_index.clone(),
+            edge_label_index:    self.edge_label_index.clone(),
+            prop_index:          self.prop_index.clone(),
+            edge_prop_index:     self.edge_prop_index.clone(),
+            index_defs:          self.index_defs.clone(),
+            constraint_defs:     self.constraint_defs.clone(),
         }));
         self.txn_pending_ops = Some(Vec::new());
-        self.txn_adj_deltas = Some(Vec::new());
         Ok(())
     }
 
@@ -969,7 +1067,6 @@ impl Graph {
             .take()
             .ok_or_else(|| DbError::Query("no active transaction".into()))?;
         self.txn_snapshot = None;
-        self.txn_adj_deltas = None;
         Ok(())
     }
 
@@ -979,18 +1076,18 @@ impl Graph {
         if self.txn_pending_ops.take().is_none() {
             return Err(DbError::Query("no active transaction".into()));
         }
-        self.txn_adj_deltas = None;
 
         if let Some(snap) = self.txn_snapshot.take() {
             // Step 1: restore all in-memory structures from snapshot (O(1) swaps).
-            self.nodes            = snap.nodes;
-            self.edges            = snap.edges;
-            self.label_index      = snap.label_index;
-            self.edge_label_index = snap.edge_label_index;
-            self.prop_index       = snap.prop_index;
-            self.edge_prop_index  = snap.edge_prop_index;
-            self.index_defs       = snap.index_defs;
-            self.constraint_defs  = snap.constraint_defs;
+            self.nodes               = snap.nodes;
+            self.edges               = snap.edges;
+            self.edges_fully_loaded  = snap.edges_fully_loaded;
+            self.label_index         = snap.label_index;
+            self.edge_label_index    = snap.edge_label_index;
+            self.prop_index          = snap.prop_index;
+            self.edge_prop_index     = snap.edge_prop_index;
+            self.index_defs          = snap.index_defs;
+            self.constraint_defs     = snap.constraint_defs;
 
             // Step 2: restore adjacency from in-memory edges.
             self.adj_out.clear();
@@ -1120,15 +1217,30 @@ impl Graph {
 impl Clone for Graph {
     fn clone(&self) -> Self {
         let mut g = Graph::new();
-        // Bulk-copy in-memory maps (no RocksDB involvement needed for the clone).
+        // Copy all in-memory maps.
         g.nodes            = self.nodes.clone();
-        g.edges            = self.edges.clone();
         g.label_index      = self.label_index.clone();
         g.edge_label_index = self.edge_label_index.clone();
         g.prop_index       = self.prop_index.clone();
         g.edge_prop_index  = self.edge_prop_index.clone();
         g.index_defs       = self.index_defs.clone();
         g.constraint_defs  = self.constraint_defs.clone();
+
+        // Edges may be partially cached; populate g.edges from source.
+        // If self already has the full set, clone it directly; otherwise scan.
+        if self.edges_fully_loaded {
+            g.edges = self.edges.clone();
+        } else {
+            g.edges = self.edges.clone(); // start with cached
+            let _ = self.store.for_each_edge_raw(|data| {
+                if let Ok(edge) = bincode::deserialize::<Edge>(data) {
+                    g.edges.entry(edge.id).or_insert(edge);
+                }
+                Ok(())
+            });
+        }
+        g.edges_fully_loaded = true;
+
         // Write everything to the clone's RocksDB (ephemeral temp dir).
         let _ = ops::write_all_to_rocksdb(&mut g);
         g
@@ -1639,5 +1751,77 @@ mod tests {
         g.drop_edge_property_index("KNOWS", "since");
         assert!(!g.has_edge_property_index("KNOWS", "since"));
         assert!(g.lookup_by_edge_property("KNOWS", "since", &Value::Int(2020)).is_none());
+    }
+
+    // ── Lazy edge cache invariants (CRIT-1, CRIT-2) ───────────────────────────
+
+    /// ROLLBACK must restore edges that existed before BEGIN even when the graph
+    /// was opened from disk (CRIT-1).  The pre-ARCH-2 bug caused `rollback` to
+    /// call `clear_all` with an empty edge snapshot, deleting all edges from
+    /// RocksDB.
+    #[test]
+    fn rollback_preserves_persisted_edges() {
+        let dir = tempfile::tempdir().unwrap().into_path();
+        // Phase 1: open, insert an edge, close.
+        {
+            let mut g = Graph::open(&dir).unwrap();
+            let a = g.alloc_node_id();
+            let b = g.alloc_node_id();
+            g.apply_insert_node(make_node(a, &["P"], Properties::new()));
+            g.apply_insert_node(make_node(b, &["P"], Properties::new()));
+            let eid = g.alloc_edge_id();
+            g.apply_insert_edge(crate::types::Edge::new(eid, "REL".into(), a, b, Properties::new(), true));
+            g.store.flush().unwrap();
+        }
+        // Phase 2: reopen, begin a transaction, add another edge, then ROLLBACK.
+        {
+            let mut g = Graph::open(&dir).unwrap();
+            let c = g.alloc_node_id();
+            let d = g.alloc_node_id();
+            g.begin_transaction().unwrap();
+            g.apply_insert_node(make_node(c, &["P"], Properties::new()));
+            g.apply_insert_node(make_node(d, &["P"], Properties::new()));
+            let eid2 = g.alloc_edge_id();
+            g.apply_insert_edge(crate::types::Edge::new(eid2, "REL".into(), c, d, Properties::new(), true));
+            g.rollback_transaction().unwrap();
+            // The pre-existing edge from phase 1 must still be in RocksDB.
+            assert_eq!(g.store.edge_count().unwrap(), 1,
+                "pre-existing edge must survive rollback");
+        }
+    }
+
+    /// `all_edges()` must return all edges from RocksDB, not just those cached
+    /// in `graph.edges` (CRIT-2).  After a lazy open the cache is empty, so a
+    /// naive `!is_empty()` fast-path would return nothing.
+    #[test]
+    fn all_edges_returns_complete_set_after_open() {
+        let dir = tempfile::tempdir().unwrap().into_path();
+        let mut edge_ids = Vec::new();
+        // Phase 1: write several edges.
+        {
+            let mut g = Graph::open(&dir).unwrap();
+            let a = g.alloc_node_id();
+            let b = g.alloc_node_id();
+            let c = g.alloc_node_id();
+            g.apply_insert_node(make_node(a, &[], Properties::new()));
+            g.apply_insert_node(make_node(b, &[], Properties::new()));
+            g.apply_insert_node(make_node(c, &[], Properties::new()));
+            for (from, to) in [(a, b), (b, c), (a, c)] {
+                let eid = g.alloc_edge_id();
+                g.apply_insert_edge(crate::types::Edge::new(eid, "E".into(), from, to, Properties::new(), true));
+                edge_ids.push(eid);
+            }
+            g.store.flush().unwrap();
+        }
+        // Phase 2: reopen and call all_edges() — must return all 3.
+        {
+            let mut g = Graph::open(&dir).unwrap();
+            let edges = g.all_edges();
+            assert_eq!(edges.len(), 3, "all_edges() must return all persisted edges");
+            let returned_ids: std::collections::HashSet<_> = edges.iter().map(|e| e.id).collect();
+            for eid in &edge_ids {
+                assert!(returned_ids.contains(eid), "edge {eid:?} must be in all_edges() result");
+            }
+        }
     }
 }

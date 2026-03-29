@@ -125,7 +125,7 @@ pub fn execute_capturing(
         Statement::OptionalMatch(m) => Ok((execute_optional_match(m, graph)?, vec![])),
         Statement::MatchOptionalMatch(m) => Ok((execute_match_optional_match(m, graph)?, vec![])),
         Statement::Unwind(u)        => Ok((execute_unwind(u, graph)?, vec![])),
-        Statement::Union(u)         => Ok((execute_union(u, graph, next_txn_id)?, vec![])),
+        Statement::Union(u)         => execute_union(u, graph, next_txn_id),
         Statement::MatchWith(mw)    => Ok((execute_match_with(mw, graph)?, vec![])),
         Statement::Insert(ins)      => execute_insert(ins, graph, next_txn_id),
         Statement::MatchInsert(mi)  => execute_match_insert(mi, graph, next_txn_id),
@@ -297,7 +297,7 @@ fn execute_match(m: MatchStatement, graph: &Graph) -> Result<Vec<Row>, DbError> 
                 for item in order {
                     let va = eval_expr_on_row(&item.expr, a).unwrap_or(Value::Null);
                     let vb = eval_expr_on_row(&item.expr, b).unwrap_or(Value::Null);
-                    let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let cmp = cmp_nulls_last(&va, &vb);
                     let cmp = if item.ascending { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal {
                         return cmp;
@@ -316,7 +316,7 @@ fn execute_match(m: MatchStatement, graph: &Graph) -> Result<Vec<Row>, DbError> 
                 for item in order {
                     let va = eval_expr(&item.expr, a, graph).unwrap_or(Value::Null);
                     let vb = eval_expr(&item.expr, b, graph).unwrap_or(Value::Null);
-                    let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let cmp = cmp_nulls_last(&va, &vb);
                     let cmp = if item.ascending { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal {
                         return cmp;
@@ -615,12 +615,14 @@ fn execute_union(
     u: UnionStatement,
     graph: &mut Graph,
     next_txn_id: &mut u64,
-) -> Result<Vec<Row>, DbError> {
+) -> Result<(Vec<Row>, Vec<crate::transaction::operation::Operation>), DbError> {
     let mut all_rows: Vec<Row> = Vec::new();
+    let mut all_ops:  Vec<crate::transaction::operation::Operation> = Vec::new();
 
     for branch in u.branches {
-        let (rows, _ops) = execute_capturing(branch, graph, next_txn_id)?;
+        let (rows, ops) = execute_capturing(branch, graph, next_txn_id)?;
         all_rows.extend(rows);
+        all_ops.extend(ops);
     }
 
     if !u.all {
@@ -634,7 +636,7 @@ fn execute_union(
         });
     }
 
-    Ok(all_rows)
+    Ok((all_rows, all_ops))
 }
 
 // ── MATCH … WITH … RETURN ──────────────────────────────────────────────────
@@ -744,7 +746,7 @@ fn apply_return_clause(
                 for item in order {
                     let va = eval_expr_on_row(&item.expr, a).unwrap_or(Value::Null);
                     let vb = eval_expr_on_row(&item.expr, b).unwrap_or(Value::Null);
-                    let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let cmp = cmp_nulls_last(&va, &vb);
                     let cmp = if item.ascending { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal { return cmp; }
                 }
@@ -760,7 +762,7 @@ fn apply_return_clause(
                 for item in order {
                     let va = eval_expr(&item.expr, a, graph).unwrap_or(Value::Null);
                     let vb = eval_expr(&item.expr, b, graph).unwrap_or(Value::Null);
-                    let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let cmp = cmp_nulls_last(&va, &vb);
                     let cmp = if item.ascending { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal { return cmp; }
                 }
@@ -1774,6 +1776,21 @@ fn eval_expr_on_row(expr: &Expr, row: &Row) -> Result<Value, DbError> {
     }
 }
 
+/// Compare two `Value`s for ORDER BY with NULL-last semantics (SQL standard).
+///
+/// - Both non-null: delegates to `partial_cmp`; NaN/incompatible types → Equal.
+/// - One null: null sorts after any non-null value (Greatest).
+/// - Both null: Equal.
+#[inline]
+fn cmp_nulls_last(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Greater,
+        (_, Value::Null) => std::cmp::Ordering::Less,
+        _ => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+    }
+}
+
 /// Evaluate a binary operator on two already-evaluated `Value`s.
 ///
 /// Comparison operators use `Value::partial_cmp` (which is defined for all
@@ -1849,9 +1866,9 @@ fn numeric_op(
 ///
 /// Aggregate functions (`count`, `sum`, etc.) are **not** handled here —
 /// they are intercepted by `eval_expr_agg` before reaching this function.
-/// If an aggregate name somehow lands here it returns a stub `Int(1)` so that
-/// the aggregate path in `execute_aggregate` still works when evaluating the
-/// first binding of a group for non-aggregate sub-expressions.
+/// If an aggregate name reaches this function it means the query used an
+/// aggregate outside an aggregating RETURN clause, which is a usage error;
+/// an explicit `DbError::Query` is returned rather than a silent stub value.
 fn eval_function(
     name: &str,
     args: &[Expr],
@@ -1859,8 +1876,12 @@ fn eval_function(
     graph: &Graph,
 ) -> Result<Value, DbError> {
     match name {
-        // Stub: real aggregation is handled by eval_expr_agg / execute_aggregate.
-        "count" => Ok(Value::Int(1)),
+        // count() is an aggregate function — it must be handled by eval_expr_agg
+        // before reaching here.  If it lands in eval_function the query has a
+        // bare count() outside an aggregating RETURN, which is a usage error.
+        "count" => Err(DbError::Query(
+            "count() is only valid inside an aggregating RETURN clause".into(),
+        )),
         "id" | "elementid" => {
             let v = eval_expr(args.first().ok_or_else(|| DbError::Query("id() requires 1 arg".into()))?,
                               bindings, graph)?;
@@ -2575,48 +2596,6 @@ fn collect_where_index_candidates(
     }
 }
 
-/// Collect candidate EdgeId sets from declared edge property indexes for
-/// predicates in `where_expr` that reference edge variable `var` with `label`.
-/// Works identically to `collect_where_index_candidates` but operates on
-/// `graph.edge_prop_index` instead of `graph.prop_index`.
-fn collect_where_edge_index_candidates(
-    graph: &Graph,
-    label: &str,
-    var: &str,
-    where_expr: &Expr,
-    out: &mut Vec<Vec<EdgeId>>,
-) {
-    for idx_def in &graph.index_defs {
-        if idx_def.label != label {
-            continue;
-        }
-        if idx_def.target != crate::graph::IndexTarget::Edge {
-            continue;
-        }
-        let prop = &idx_def.property;
-
-        if let Some(eq_val) = extract_where_equality(where_expr, var, prop) {
-            if let Some(ids) = graph.lookup_by_edge_property(label, prop, eq_val) {
-                out.push(ids);
-                continue;
-            }
-        }
-
-        let (lo, hi) = extract_prop_range(where_expr, var, prop);
-        if lo.is_some() || hi.is_some() {
-            if let Some(ids) = graph.lookup_by_edge_property_range(label, prop, lo, hi) {
-                out.push(ids);
-                continue;
-            }
-        }
-
-        if let Some(prefix) = extract_starts_with(where_expr, var, prop) {
-            if let Some(ids) = graph.lookup_by_edge_property_prefix(label, prop, prefix) {
-                out.push(ids);
-            }
-        }
-    }
-}
 
 /// Extract the literal value from an equality predicate `var.prop = literal`
 /// (or `literal = var.prop`) anywhere in the expression tree (through AND).
@@ -3028,11 +3007,17 @@ fn execute_create_index(
     let (already, op) = if is_edge_label && !is_node_label {
         let already = graph.has_edge_property_index(&ci.label, &ci.property);
         graph.create_edge_property_index(&ci.label, &ci.property);
-        (already, Operation::CreateIndex { label: ci.label.clone(), property: ci.property.clone() })
+        (already, Operation::CreateIndex {
+            label: ci.label.clone(), property: ci.property.clone(),
+            target: crate::graph::IndexTarget::Edge,
+        })
     } else {
         let already = graph.has_property_index(&ci.label, &ci.property);
         graph.apply_create_index(&ci.label, &ci.property);
-        (already, Operation::CreateIndex { label: ci.label.clone(), property: ci.property.clone() })
+        (already, Operation::CreateIndex {
+            label: ci.label.clone(), property: ci.property.clone(),
+            target: crate::graph::IndexTarget::Node,
+        })
     };
     let txn_id = *next_txn_id;
     *next_txn_id += 1;
@@ -7494,5 +7479,86 @@ mod tests {
         ).unwrap();
         let names: Vec<String> = col(&rows, "n.name");
         assert_eq!(names, vec![r#""Albert""#]);
+    }
+
+    // ── Order-by NULL semantics (LOW-5) ─────────────────────────────────────
+
+    #[test]
+    fn order_by_null_values_sort_last_asc() {
+        // Nodes with a missing property return NULL for that column.
+        // NULL should sort after all non-NULL values in ASC order (SQL standard).
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "B", rank: 2})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "A", rank: 1})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "C"})"#).unwrap(); // no rank → NULL
+
+        let rows = run(
+            &mut g, &mut txn,
+            "MATCH (n:Item) RETURN n.name ORDER BY n.rank ASC",
+        ).unwrap();
+        let names = col(&rows, "n.name");
+        // A (rank=1) < B (rank=2) < C (rank=NULL) — null must be last in ASC
+        assert_eq!(names[0], r#""A""#, "rank=1 should be first");
+        assert_eq!(names[1], r#""B""#, "rank=2 should be second");
+        assert_eq!(names[2], r#""C""#, "node with null rank should be last in ASC");
+    }
+
+    #[test]
+    fn order_by_null_values_sort_first_desc() {
+        // In DESC order the comparator is reversed, so NULL-last in ASC becomes
+        // NULL-first in DESC (same as standard SQL behavior).
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "B", rank: 2})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "A", rank: 1})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "C"})"#).unwrap(); // no rank → NULL
+
+        let rows = run(
+            &mut g, &mut txn,
+            "MATCH (n:Item) RETURN n.name ORDER BY n.rank DESC",
+        ).unwrap();
+        let names = col(&rows, "n.name");
+        // DESC reversal: NULL (Greater when ASC) → first; then rank=2, then rank=1
+        assert_eq!(names[0], r#""C""#, "node with null rank should be first in DESC");
+        assert_eq!(names[1], r#""B""#, "rank=2 should be second");
+        assert_eq!(names[2], r#""A""#, "rank=1 should be last");
+    }
+
+    // ── count() outside aggregate context (LOW-2) ────────────────────────────
+
+    #[test]
+    fn count_outside_aggregating_return_errors() {
+        // count() is an aggregate function — using it in a non-aggregate context
+        // (e.g. as an argument to another function) should surface an error rather
+        // than silently returning 1 (the old stub behavior).
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, r#"INSERT (:X {v: 1})"#).unwrap();
+        // Bare count() used as an argument to toString() bypasses the aggregate
+        // path and should hit the explicit error in eval_function.
+        let result = run(&mut g, &mut txn, "MATCH (n:X) RETURN toString(count(n)) AS s");
+        assert!(result.is_err(), "count() outside aggregate RETURN must error");
+    }
+
+    // ── UNION write persistence (HIGH-2) ─────────────────────────────────────
+
+    #[test]
+    fn union_insert_branches_both_execute() {
+        // Each branch of a UNION is a valid single_stmt, including INSERT.
+        // Previously, ops from UNION branches were discarded — the in-memory
+        // write happened but no Operation was recorded, so the node would
+        // vanish on rollback and not be WAL-logged.
+        //
+        // After the fix, ops from both branches are collected and returned to
+        // the caller.  Both inserts must be visible in subsequent queries.
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(
+            &mut g, &mut txn,
+            r#"INSERT (:Tag {name: "alpha"}) UNION ALL INSERT (:Tag {name: "beta"})"#,
+        ).unwrap();
+        let rows = run(&mut g, &mut txn, "MATCH (n:Tag) RETURN n.name").unwrap();
+        assert_eq!(rows.len(), 2, "both UNION INSERT branches must produce visible nodes");
     }
 }

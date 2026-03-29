@@ -45,13 +45,14 @@ pyo3        = { version = "0.22", features = ["abi3-py39", "extension-module"], 
 tokio       = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "signal"], optional = true }
 toml        = "0.8"
 sha2        = { version = "0.10", optional = true }
+rand        = { version = "0.8", features = ["std"], optional = true }
 rpassword   = { version = "7", optional = true }
 axum        = { version = "0.7", optional = true }
 
 [features]
 default = ["repl", "server", "gui"]
 repl    = ["rustyline", "dirs", "rpassword"]
-server  = ["dep:tokio", "dep:sha2", "dirs"]
+server  = ["dep:tokio", "dep:sha2", "dep:rand", "dirs"]
 gui     = ["server", "dep:axum"]
 python  = ["pyo3", "dirs"]
 

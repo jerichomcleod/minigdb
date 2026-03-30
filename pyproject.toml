@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "minigdb"
-version = "0.1.2"
+version = "0.1.1"
 requires-python = ">=3.8"
 description = "Embeddable property graph database with GQL query language, graph algorithms, and Python bindings"
 readme = "README.md"

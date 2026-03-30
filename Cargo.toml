@@ -1,6 +1,6 @@
 [package]
 name = "minigdb"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "An embedded property-graph database in Rust with a GQL query language, RocksDB-backed ACID storage, graph algorithms, and Python bindings"
 license = "MPL-2.0"

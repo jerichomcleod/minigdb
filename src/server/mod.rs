@@ -73,6 +73,7 @@
 pub mod auth;
 #[cfg(feature = "gui")]
 pub mod http;
+pub mod locations;
 pub mod protocol;
 pub mod registry;
 
@@ -91,12 +92,16 @@ use registry::{GraphRegistry, GraphState};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Bind on `addr` and serve all named graphs under `graphs_dir` indefinitely.
+/// Bind on `addr` and serve all named graphs indefinitely.
 ///
 /// # Arguments
 /// - `config` — server configuration including auth settings and user list.
-/// - `graphs_dir` — filesystem root under which per-graph subdirectories live.
-///   Each graph's RocksDB data is stored at `<graphs_dir>/<name>/`.
+/// - `data_root` — server data directory (e.g. `~/.local/share/minigdb`).
+///   The primary graph root is `<data_root>/graphs/`.  Extra roots are loaded
+///   from `<data_root>/locations.toml` and can be modified at runtime via
+///   admin commands.
+/// - `session_roots` — additional graph-root directories for this process
+///   lifetime only (e.g. from `--graphs-dir` on the CLI).  Not persisted.
 /// - `addr` — TCP address to listen on (e.g. `127.0.0.1:7474`).
 /// - `gui_addr` — if `Some`, also starts the HTTP GUI server on that address.
 ///   Requires the `gui` Cargo feature; if the feature is disabled this
@@ -113,11 +118,14 @@ use registry::{GraphRegistry, GraphState};
 /// This function never returns under normal operation.
 pub async fn serve(
     config: ServerConfig,
-    graphs_dir: PathBuf,
+    data_root: PathBuf,
+    session_roots: Vec<PathBuf>,
     addr: SocketAddr,
     gui_addr: Option<SocketAddr>,
 ) -> std::io::Result<()> {
-    let registry = GraphRegistry::new(graphs_dir);
+    std::fs::create_dir_all(data_root.join("graphs"))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let registry = GraphRegistry::new(data_root, session_roots);
     let listener = TcpListener::bind(addr).await?;
     eprintln!("minigdb listening on {addr}  (Ctrl-C to stop)");
 
@@ -231,7 +239,10 @@ async fn handle(
     .await?;
 
     // Phase 2: Auth handshake (only when auth_required is enabled).
+    // MED-4: Limit failed auth attempts per connection to prevent brute force.
+    const MAX_AUTH_ATTEMPTS: u32 = 5;
     let user = if config.server.auth_required {
+        let mut auth_attempts: u32 = 0;
         // Loop until we receive a valid auth attempt or the client disconnects.
         loop {
             let line = match lines.next_line().await? {
@@ -254,8 +265,20 @@ async fn handle(
                             .await?;
                             break user;
                         }
-                        // User not found or wrong password: reject and close.
+                        // User not found or wrong password: increment counter.
                         _ => {
+                            auth_attempts += 1;
+                            if auth_attempts >= MAX_AUTH_ATTEMPTS {
+                                send_msg(
+                                    &mut write_half,
+                                    &ServerMessage::AuthFail {
+                                        error: "too many failed authentication attempts"
+                                            .to_string(),
+                                    },
+                                )
+                                .await?;
+                                return Ok(());
+                            }
                             send_msg(
                                 &mut write_half,
                                 &ServerMessage::AuthFail {
@@ -263,7 +286,7 @@ async fn handle(
                                 },
                             )
                             .await?;
-                            return Ok(());
+                            // Do not close — allow the client to retry.
                         }
                     }
                 }
@@ -286,6 +309,8 @@ async fn handle(
     };
 
     // Phase 3: Query loop — process one JSON line per iteration.
+    // MED-5: Reject messages that exceed MAX_MSG_BYTES to prevent memory exhaustion.
+    const MAX_MSG_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
     let mut state = ConnectionState {
         user,
         current_graph: "default".to_string(),
@@ -293,6 +318,15 @@ async fn handle(
     };
 
     while let Some(line) = lines.next_line().await? {
+        if line.len() > MAX_MSG_BYTES {
+            let resp = Response::err(
+                0,
+                format!("message too large: {} bytes (limit {MAX_MSG_BYTES})", line.len()),
+                std::time::Duration::ZERO,
+            );
+            send(&mut write_half, &resp).await?;
+            break;
+        }
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
@@ -303,8 +337,7 @@ async fn handle(
     // Phase 4: Cleanup — auto-rollback any open transaction on disconnect.
     // Dropping the guard releases the mutex so other connections can proceed.
     if let Some(mut guard) = state.txn_lock.take() {
-        let (graph, _) = &mut *guard;
-        let _ = graph.rollback_transaction();
+        let _ = guard.graph.rollback_transaction();
     }
 
     Ok(())
@@ -373,12 +406,15 @@ async fn dispatch_line<W: AsyncWriteExt + Unpin>(
 /// - `Admin` — one of the admin sub-commands described below.
 ///
 /// # Admin sub-commands
-/// | `cmd`     | `name` required? | Description                              |
-/// |-----------|-----------------|------------------------------------------|
-/// | `graphs`  | no              | List all open graphs in the registry.    |
-/// | `stats`   | no              | Alias for `graphs`; returns `open_graphs`.|
-/// | `create`  | yes             | Create a new named graph on disk.        |
-/// | `drop`    | yes             | Delete a named graph from disk.          |
+/// | `cmd`            | args           | Description                               |
+/// |------------------|----------------|-------------------------------------------|
+/// | `graphs`         | —              | List all user-visible graph names.        |
+/// | `stats`          | —              | Alias for `graphs`; returns `open_graphs`.|
+/// | `create`         | `name`         | Create a new named graph on disk.         |
+/// | `drop`           | `name`         | Delete a named graph from disk.           |
+/// | `locations`      | —              | List all registered graph-root dirs.      |
+/// | `add_location`   | `path`         | Register an extra root directory.         |
+/// | `remove_location`| `path`         | Unregister an extra root directory.       |
 ///
 /// Unknown commands return [`ServerMessage::AdminFail`].
 async fn handle_client_message<W: AsyncWriteExt + Unpin>(
@@ -396,7 +432,7 @@ async fn handle_client_message<W: AsyncWriteExt + Unpin>(
             })
             .await
         }
-        ClientMessage::Admin { cmd, name } => match cmd.as_str() {
+        ClientMessage::Admin { cmd, name, path } => match cmd.as_str() {
             "graphs" => {
                 let graphs = registry.list().await;
                 send_msg(
@@ -477,6 +513,59 @@ async fn handle_client_message<W: AsyncWriteExt + Unpin>(
                         .await
                     }
                 },
+            },
+            "locations" => {
+                let locs = registry.list_locations().await;
+                let arr: Vec<serde_json::Value> = locs
+                    .into_iter()
+                    .map(|(p, primary)| serde_json::json!({
+                        "path": p.to_string_lossy(),
+                        "primary": primary,
+                    }))
+                    .collect();
+                send_msg(
+                    write,
+                    &ServerMessage::AdminOk {
+                        data: serde_json::json!({ "locations": arr }),
+                    },
+                )
+                .await
+            }
+            "add_location" => match path.as_deref() {
+                None => {
+                    send_msg(write, &ServerMessage::AdminFail {
+                        error: "add_location requires 'path'".to_string(),
+                    })
+                    .await
+                }
+                Some(p) => {
+                    match registry.add_location(std::path::PathBuf::from(p)).await {
+                        Ok(()) => send_msg(write, &ServerMessage::AdminOk {
+                            data: serde_json::json!({}),
+                        }).await,
+                        Err(e) => send_msg(write, &ServerMessage::AdminFail {
+                            error: e.to_string(),
+                        }).await,
+                    }
+                }
+            },
+            "remove_location" => match path.as_deref() {
+                None => {
+                    send_msg(write, &ServerMessage::AdminFail {
+                        error: "remove_location requires 'path'".to_string(),
+                    })
+                    .await
+                }
+                Some(p) => {
+                    match registry.remove_location(std::path::Path::new(p)).await {
+                        Ok(()) => send_msg(write, &ServerMessage::AdminOk {
+                            data: serde_json::json!({}),
+                        }).await,
+                        Err(e) => send_msg(write, &ServerMessage::AdminFail {
+                            error: e.to_string(),
+                        }).await,
+                    }
+                }
             },
             other => {
                 send_msg(
@@ -570,8 +659,14 @@ async fn handle_query<W: AsyncWriteExt + Unpin>(
                         // stored without borrowing the Arc itself.  This guard
                         // keeps the graph exclusively locked until it is dropped.
                         let mut guard = arc.lock_owned().await;
-                        let (graph, _) = &mut *guard;
-                        match graph.begin_transaction() {
+                        if guard.dropped {
+                            return send(write, &Response::err(
+                                id,
+                                format!("graph '{}' has been dropped", state.current_graph),
+                                start.elapsed(),
+                            )).await;
+                        }
+                        match guard.graph.begin_transaction() {
                             Ok(()) => {
                                 // Store the guard — the mutex remains locked.
                                 state.txn_lock = Some(guard);
@@ -585,8 +680,7 @@ async fn handle_query<W: AsyncWriteExt + Unpin>(
         }
         "COMMIT" => {
             if let Some(mut guard) = state.txn_lock.take() {
-                let (graph, _) = &mut *guard;
-                match graph.commit_transaction() {
+                match guard.graph.commit_transaction() {
                     Ok(()) => Response::ok(id, vec![], start.elapsed()),
                     Err(e) => {
                         // On commit error, the guard is dropped here, implicitly
@@ -600,8 +694,7 @@ async fn handle_query<W: AsyncWriteExt + Unpin>(
         }
         "ROLLBACK" => {
             if let Some(mut guard) = state.txn_lock.take() {
-                let (graph, _) = &mut *guard;
-                match graph.rollback_transaction() {
+                match guard.graph.rollback_transaction() {
                     Ok(()) => Response::ok(id, vec![], start.elapsed()),
                     Err(e) => Response::err(id, e.to_string(), start.elapsed()),
                 }
@@ -612,17 +705,36 @@ async fn handle_query<W: AsyncWriteExt + Unpin>(
         _ => {
             // Normal GQL query — use the held transaction guard or a transient lock.
             if let Some(ref mut guard) = state.txn_lock {
-                // Reuse the existing exclusive guard; no new lock acquisition needed.
-                let (graph, txn_id) = &mut **guard;
-                execute_and_build_response(id, &req.query, graph, txn_id, start)
+                // Check whether the graph was dropped while the transaction was open.
+                if guard.dropped {
+                    Response::err(
+                        id,
+                        format!("graph '{}' has been dropped", state.current_graph),
+                        start.elapsed(),
+                    )
+                } else {
+                    // Reuse the existing exclusive guard; no new lock acquisition needed.
+                    // Destructure into separate field references so the borrow checker
+                    // can confirm the two mutable borrows are non-overlapping.
+                    let GraphState { graph, txn_id, .. } = &mut **guard;
+                    execute_and_build_response(id, &req.query, graph, txn_id, start)
+                }
             } else {
                 // No active transaction: acquire a per-query lock.
                 match registry.get_or_open(&state.current_graph).await {
                     Err(e) => Response::err(id, e.to_string(), start.elapsed()),
                     Ok(arc) => {
                         let mut guard = arc.lock().await;
-                        let (graph, txn_id) = &mut *guard;
-                        execute_and_build_response(id, &req.query, graph, txn_id, start)
+                        if guard.dropped {
+                            Response::err(
+                                id,
+                                format!("graph '{}' has been dropped", state.current_graph),
+                                start.elapsed(),
+                            )
+                        } else {
+                            let GraphState { graph, txn_id, .. } = &mut *guard;
+                            execute_and_build_response(id, &req.query, graph, txn_id, start)
+                        }
                     }
                 }
             }
@@ -701,7 +813,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let graphs_dir = tempfile::tempdir().unwrap().into_path();
+        let data_root = tempfile::tempdir().unwrap().into_path();
         let config = ServerConfig {
             server: auth::ServerSection { auth_required: false },
             users: vec![],
@@ -712,7 +824,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(serve(config, graphs_dir, addr, None))
+                .block_on(serve(config, data_root, vec![], addr, None))
                 .unwrap();
         });
 
@@ -726,7 +838,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let graphs_dir = tempfile::tempdir().unwrap().into_path();
+        let data_root = tempfile::tempdir().unwrap().into_path();
         let config = ServerConfig {
             server: auth::ServerSection { auth_required: true },
             users,
@@ -737,7 +849,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(serve(config, graphs_dir, addr, None))
+                .block_on(serve(config, data_root, vec![], addr, None))
                 .unwrap();
         });
 
@@ -1287,7 +1399,7 @@ mod tests {
         let http_addr = http_l.local_addr().unwrap();
         drop(http_l);
 
-        let graphs_dir = tempfile::tempdir().unwrap().into_path();
+        let data_root = tempfile::tempdir().unwrap().into_path();
         let config = ServerConfig {
             server: auth::ServerSection { auth_required: false },
             users: vec![],
@@ -1298,7 +1410,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(serve(config, graphs_dir, tcp_addr, Some(http_addr)))
+                .block_on(serve(config, data_root, vec![], tcp_addr, Some(http_addr)))
                 .unwrap();
         });
 

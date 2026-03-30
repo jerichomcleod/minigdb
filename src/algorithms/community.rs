@@ -24,10 +24,14 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use crate::graph::Graph;
 use crate::types::{ulid_encode, DbError, Value};
 
 use super::{opt_direction, opt_usize, Direction, GraphSnapshot, Row};
+
+const PAR_N: usize = 256;
 
 pub fn run_label_propagation(
     graph: &Graph,
@@ -52,24 +56,20 @@ pub fn run_label_propagation(
     let mut label: Vec<usize> = (0..n).collect();
 
     for _ in 0..max_iter {
-        let mut changed = false;
-
-        // Synchronous propagation (update all labels simultaneously).
+        // Synchronous propagation: read from prev_label, write to new label vec.
+        // All per-node updates depend only on prev_label (not each other),
+        // so the loop is embarrassingly parallel.
         let prev_label = label.clone();
 
-        for i in 0..n {
+        let update_node = |i: usize| -> (usize, bool) {
             let nbrs = snap.unique_neighbor_indices(i, direction);
             if nbrs.is_empty() {
-                continue; // isolated node keeps its own label
+                return (prev_label[i], false);
             }
-
-            // Count frequencies of neighbour labels.
             let mut freq: HashMap<usize, usize> = HashMap::new();
             for &j in &nbrs {
                 *freq.entry(prev_label[j]).or_insert(0) += 1;
             }
-
-            // Choose the most frequent label; ties broken by minimum label.
             let max_freq = *freq.values().max().unwrap();
             let best = freq
                 .into_iter()
@@ -77,12 +77,17 @@ pub fn run_label_propagation(
                 .map(|(lbl, _)| lbl)
                 .min()
                 .unwrap();
+            (best, prev_label[i] != best)
+        };
 
-            if label[i] != best {
-                label[i] = best;
-                changed = true;
-            }
-        }
+        let updates: Vec<(usize, bool)> = if n >= PAR_N {
+            (0..n).into_par_iter().map(update_node).collect()
+        } else {
+            (0..n).map(update_node).collect()
+        };
+
+        let changed = updates.iter().any(|&(_, c)| c);
+        label = updates.into_iter().map(|(l, _)| l).collect();
 
         if !changed {
             break;

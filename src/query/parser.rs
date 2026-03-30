@@ -1436,6 +1436,11 @@ fn build_primary(pair: Pair<Rule>) -> Result<Expr, DbError> {
     let child = pair.into_inner().next().unwrap();
     match child.as_rule() {
         Rule::literal => Ok(Expr::Literal(build_literal(child)?)),
+        Rule::count_distinct_call => {
+            // count(DISTINCT expr) — build as Expr::Call("count_distinct", [arg])
+            let arg = build_expr(child.into_inner().next().unwrap())?;
+            Ok(Expr::Call("count_distinct".to_string(), vec![arg]))
+        }
         Rule::func_call => build_func_call(child),
         Rule::prop_access => {
             // prop_access = { ident ~ "." ~ ident }

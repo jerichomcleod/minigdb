@@ -9,8 +9,8 @@ An embedded property-graph database built in Rust on RocksDB. Property graph mod
 **Feature highlights:**
 - GQL queries: `MATCH`, `INSERT`, `SET`, `DELETE`, variable-length paths, `OPTIONAL MATCH`, `UNION`, aggregates, `WITH`, `UNWIND`
 - 15 built-in graph algorithms: PageRank, shortest path, community detection (Louvain/Leiden), centrality measures, max-flow, and more
-- Property indexes, uniqueness and type constraints, parameterized queries, CSV bulk import
-- Multi-graph support, explicit transactions
+- Property indexes with automatic pushdown for equality, range, and `startsWith()` prefix queries; uniqueness and type constraints, parameterized queries, CSV bulk import
+- Multi-graph support, explicit transactions with O(ops-in-transaction) adjacency rollback
 - TCP server with authentication, per-connection transaction isolation, and an embedded web GUI
 - Python bindings via PyO3 with polars/pandas DataFrame output
 
@@ -52,11 +52,14 @@ The REPL auto-detects complete statements, so semicolons are optional. Multi-lin
 
 | Command | Effect |
 |---------|--------|
-| `:graphs` | List all graphs, marking the active one |
+| `:graphs` | List all graphs across all registered roots, marking the active one |
 | `:create <name>` | Create a new named graph and switch to it |
 | `:use <name>` | Checkpoint the current graph and switch to an existing one |
 | `:drop <name>` | Permanently delete a named graph |
 | `:checkpoint` | Force a snapshot and truncate the WAL immediately |
+| `:locations` | List registered graph-root directories |
+| `:add-location <path>` | Register an additional graph-root directory (persisted) |
+| `:remove-location <path>` | Remove a registered graph-root directory (persisted) |
 | `:quit` or `:q` | Exit (writes a final checkpoint) |
 | `Ctrl-C` | Cancel the current input line |
 | `Ctrl-D` | Exit |

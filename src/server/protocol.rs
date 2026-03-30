@@ -86,6 +86,10 @@ pub enum ClientMessage {
         /// Graph name argument (used by `create` and `drop`).
         #[serde(default)]
         name: Option<String>,
+        /// Filesystem path argument (used by `add_location` and
+        /// `remove_location`).
+        #[serde(default)]
+        path: Option<String>,
     },
 }
 

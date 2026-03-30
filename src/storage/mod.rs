@@ -117,8 +117,14 @@ pub(crate) fn apply_ops(graph: &mut Graph, ops: &[Operation]) -> Result<(), DbEr
                 graph.apply_delete_edge(*edge_id)?;
             }
 
-            CreateIndex { label, property } => {
-                graph.apply_create_index(label, property);
+            CreateIndex { label, property, target } => {
+                // Use the stored target instead of the heuristic (MED-9).
+                match target {
+                    crate::graph::IndexTarget::Edge =>
+                        { graph.create_edge_property_index(label, property); }
+                    crate::graph::IndexTarget::Node =>
+                        { graph.create_property_index(label, property); }
+                }
             }
 
             DropIndex { label, property } => {

@@ -73,11 +73,16 @@
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::cmp::Reverse;
 
+use rayon::prelude::*;
+
 use crate::graph::Graph;
 use crate::types::{ulid_encode, DbError, Value};
 
 use super::{opt_bool, opt_direction, opt_f64, opt_usize, opt_weight_prop, Direction,
             GraphSnapshot, Row};
+
+/// Minimum node count at which Rayon parallelism pays off over serial execution.
+const PAR_N: usize = 256;
 
 // ── PageRank ──────────────────────────────────────────────────────────────────
 
@@ -143,36 +148,50 @@ pub fn run_pagerank(graph: &Graph, params: &HashMap<String, Value>) -> Result<Ve
     let teleport = (1.0 - damping) / n as f64;
 
     for _ in 0..iterations {
-        let mut new_rank = vec![0.0f64; n];
+        // Total rank held by dangling nodes (no out-edges), redistributed uniformly.
+        let dangling_sum: f64 = if n >= PAR_N {
+            rank.par_iter()
+                .enumerate()
+                .filter(|&(i, _)| snap.adj_out[i].is_empty())
+                .map(|(_, &r)| r)
+                .sum::<f64>()
+                / n as f64
+        } else {
+            rank.iter()
+                .enumerate()
+                .filter(|&(i, _)| snap.adj_out[i].is_empty())
+                .map(|(_, &r)| r)
+                .sum::<f64>()
+                / n as f64
+        };
 
-        // Compute the total rank held by dangling nodes (no out-edges).
-        // This mass is redistributed uniformly to all nodes each iteration
-        // so that the total rank stays normalised.
-        let dangling_sum: f64 = rank
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| snap.adj_out[i].is_empty())
-            .map(|(_, &r)| r)
-            .sum::<f64>()
-            / n as f64;
-
-        // Each node receives teleportation + its share of dangling mass.
-        for v in 0..n {
-            new_rank[v] += teleport + damping * dangling_sum;
-        }
-
-        // Propagate rank along each outgoing edge, weighted by the edge's
-        // fraction of the source node's total outgoing weight.
-        for u in 0..n {
-            if snap.adj_out[u].is_empty() {
-                continue; // dangling nodes already handled above
+        // Pull-based rank: each node v independently pulls contributions from
+        // its predecessors.  This formulation is embarrassingly parallel —
+        // every v reads from `rank` (shared, read-only) and writes only to its
+        // own slot in `new_rank`.
+        let new_rank: Vec<f64> = if n >= PAR_N {
+            (0..n).into_par_iter().map(|v| {
+                let pull: f64 = snap.adj_in[v].iter()
+                    .filter(|&&(u, _)| !snap.adj_out[u].is_empty())
+                    .map(|&(u, w)| {
+                        let denom = out_weight_sum[u];
+                        if denom > 0.0 { rank[u] * damping * (w.max(0.0) / denom) } else { 0.0 }
+                    })
+                    .sum();
+                teleport + damping * dangling_sum + pull
+            }).collect()
+        } else {
+            // Serial push-based for small graphs.
+            let mut nr = vec![teleport + damping * dangling_sum; n];
+            for u in 0..n {
+                if snap.adj_out[u].is_empty() { continue; }
+                let denom = out_weight_sum[u];
+                for &(v, w) in &snap.adj_out[u] {
+                    nr[v] += rank[u] * damping * (w.max(0.0) / denom);
+                }
             }
-            let denom = out_weight_sum[u];
-            for &(v, w) in &snap.adj_out[u] {
-                let contrib = rank[u] * damping * (w.max(0.0) / denom);
-                new_rank[v] += contrib;
-            }
-        }
+            nr
+        };
 
         // Check convergence: maximum absolute change across all nodes.
         let delta: f64 = rank
@@ -271,33 +290,45 @@ pub fn run_betweenness(graph: &Graph, params: &HashMap<String, Value>) -> Result
         (0..sample_size).map(|k| k * step).collect()
     };
 
-    for &s in &sources {
-        // BFS (unweighted) or Dijkstra (weighted) from source s.
-        // Returns: distance array, shortest-path count array, predecessor lists.
+    // Each source's BFS + back-propagation is independent of all others,
+    // so the outer loop is embarrassingly parallel.
+    let accumulate_source = |s: usize| -> Vec<f64> {
         let (dist, sigma, pred) = if weight_prop.is_none() {
             brandes_bfs(&snap, s, dir)
         } else {
             brandes_dijkstra(&snap, s, dir)
         };
-
-        // Back-propagate the dependency score δ from farthest to closest nodes.
         let mut delta = vec![0.0f64; n];
-
-        // Process nodes in non-increasing distance order (farthest first).
         let mut stack_order: Vec<usize> = (0..n).filter(|&v| dist[v].is_finite()).collect();
         stack_order.sort_unstable_by(|&a, &b| dist[b].partial_cmp(&dist[a]).unwrap());
-
+        let mut partial = vec![0.0f64; n];
         for &w in &stack_order {
             for &v in &pred[w] {
                 if sigma[w] > 0.0 {
-                    // Dependency accumulation: each predecessor v receives a
-                    // fraction proportional to its share of paths through w.
                     delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w]);
                 }
             }
             if w != s {
-                betweenness[w] += delta[w];
+                partial[w] += delta[w];
             }
+        }
+        partial
+    };
+
+    if sources.len() >= PAR_N {
+        betweenness = sources.par_iter()
+            .map(|&s| accumulate_source(s))
+            .reduce(
+                || vec![0.0f64; n],
+                |mut acc, partial| {
+                    for (a, p) in acc.iter_mut().zip(partial.iter()) { *a += p; }
+                    acc
+                },
+            );
+    } else {
+        for &s in &sources {
+            let partial = accumulate_source(s);
+            for (a, p) in betweenness.iter_mut().zip(partial.iter()) { *a += p; }
         }
     }
 
@@ -460,19 +491,14 @@ pub fn run_closeness(graph: &Graph, params: &HashMap<String, Value>) -> Result<V
         return Ok(vec![]);
     }
 
-    let mut rows = Vec::with_capacity(n);
-
-    for s in 0..n {
-        // BFS from s to compute hop distances to all reachable nodes.
+    // Closeness BFS from each source is independent — embarrassingly parallel.
+    let compute_score = |s: usize| -> f64 {
         let mut dist = vec![usize::MAX; n];
         dist[s] = 0;
         let mut queue = VecDeque::new();
         queue.push_back(s);
-
-        // Count reachable nodes and their total distance from s.
         let mut reachable = 0usize;
         let mut sum_dist = 0usize;
-
         while let Some(v) = queue.pop_front() {
             for (w, _) in snap.neighbors(v, direction) {
                 if dist[w] == usize::MAX {
@@ -483,36 +509,33 @@ pub fn run_closeness(graph: &Graph, params: &HashMap<String, Value>) -> Result<V
                 }
             }
         }
-
-        // Compute the closeness score, applying optional corrections.
-        let score = if sum_dist == 0 || reachable == 0 {
-            // Isolated node (or no outgoing reachable nodes) — score is 0.
+        if sum_dist == 0 || reachable == 0 {
             0.0
         } else {
             let raw = reachable as f64 / sum_dist as f64;
             if wf_improved {
-                // Wasserman-Faust: multiply by (reachable/(N-1))^2 to
-                // penalise nodes that cannot reach most of the graph.
                 let wf = (reachable as f64 / (n as f64 - 1.0)).powi(2);
                 if normalized { raw * wf } else { raw * wf * (n as f64 - 1.0) }
             } else if normalized {
                 raw
             } else {
-                // Unnormalized: raw closeness × (N-1) = 1 / mean_dist
                 raw * (n as f64 - 1.0)
             }
-        };
+        }
+    };
 
+    let scores: Vec<f64> = if n >= PAR_N {
+        (0..n).into_par_iter().map(compute_score).collect()
+    } else {
+        (0..n).map(compute_score).collect()
+    };
+
+    Ok(scores.into_iter().enumerate().map(|(s, score)| {
         let mut row = HashMap::new();
-        row.insert(
-            "node".to_string(),
-            Value::String(ulid_encode(snap.node_ids[s].0)),
-        );
+        row.insert("node".to_string(), Value::String(ulid_encode(snap.node_ids[s].0)));
         row.insert("score".to_string(), Value::Float(score));
-        rows.push(row);
-    }
-
-    Ok(rows)
+        row
+    }).collect())
 }
 
 // ── Degree Centrality ─────────────────────────────────────────────────────────

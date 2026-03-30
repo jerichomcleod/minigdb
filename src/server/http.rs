@@ -48,11 +48,10 @@
 //!   locking means transactions opened over HTTP are scoped to one request and
 //!   cannot span multiple HTTP calls (unlike the TCP protocol).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Path, State},
@@ -69,10 +68,19 @@ use crate::types::{ulid_decode, ulid_encode, EdgeId, NodeId};
 use super::{
     auth::{verify_password, ServerConfig},
     protocol::{row_to_json, value_to_json},
-    registry::GraphRegistry,
+    registry::{GraphRegistry, GraphState},
 };
 
 // ── App state ─────────────────────────────────────────────────────────────────
+
+/// A session token entry with username and issue time for expiry checking.
+struct TokenEntry {
+    _username: String,
+    issued_at: Instant,
+}
+
+/// Session token TTL: tokens are valid for 8 hours after issuance.
+const TOKEN_TTL: Duration = Duration::from_secs(8 * 3600);
 
 /// Shared state injected into every Axum handler via [`State`].
 ///
@@ -83,37 +91,24 @@ struct AppState {
     registry: Arc<GraphRegistry>,
     /// Server configuration (auth settings + user list).
     config: Arc<ServerConfig>,
-    /// Active session tokens (cleared on server restart).
-    ///
-    /// Stored in a `Mutex<HashSet>` so concurrent requests can check/insert
-    /// tokens without a `RwLock` (token lookups are fast and infrequent).
-    tokens: Arc<Mutex<HashSet<String>>>,
+    /// Active session tokens mapped to their entry (username + issue time).
+    /// Cleared on server restart.
+    tokens: Arc<Mutex<HashMap<String, TokenEntry>>>,
 }
 
 // ── Token generation ──────────────────────────────────────────────────────────
 
-/// Generate a pseudo-random 128-bit opaque bearer token.
+/// Generate a cryptographically random 256-bit opaque bearer token.
 ///
-/// The token is produced by combining:
-/// - The current wall-clock time in nanoseconds (lower 64 bits), providing
-///   uniqueness across server restarts and widely-spaced calls.
-/// - A monotonically-incrementing counter mixed with the timestamp, ensuring
-///   uniqueness even for calls within the same nanosecond (e.g. in tests).
-///
-/// The result is a 32-character lowercase hexadecimal string.  While this is
-/// not cryptographically secure (no CSPRNG), it is sufficient for a
-/// development/single-host deployment where token guessing is not a realistic
-/// attack vector.
+/// Uses the OS-backed CSPRNG via `rand::thread_rng()` to produce 32 random
+/// bytes, which are hex-encoded to a 64-character lowercase string.  This
+/// provides 256 bits of entropy, making token guessing computationally
+/// infeasible.
 fn gen_token() -> String {
-    // AtomicU64 counter survives across calls in the same process lifetime.
-    static CTR: AtomicU64 = AtomicU64::new(0);
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    // Mix the counter with the timestamp to avoid collisions within the same ns.
-    let c = CTR.fetch_add(1, Ordering::Relaxed);
-    format!("{:016x}{:016x}", t, c.wrapping_add(t >> 3))
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
@@ -123,7 +118,10 @@ fn gen_token() -> String {
 /// When `state.config.server.auth_required` is `false`, every request is
 /// allowed regardless of headers.  Otherwise the function requires an
 /// `Authorization: Bearer <token>` header where `<token>` is present in
-/// [`AppState::tokens`].
+/// [`AppState::tokens`] and has not expired (TTL = [`TOKEN_TTL`]).
+///
+/// Expired tokens are pruned from the map on each check to avoid unbounded
+/// growth.
 async fn is_auth(headers: &HeaderMap, state: &AppState) -> bool {
     if !state.config.server.auth_required {
         return true;
@@ -134,8 +132,11 @@ async fn is_auth(headers: &HeaderMap, state: &AppState) -> bool {
     };
     // Must be a Bearer token — strip the prefix.
     let Some(tok) = v.strip_prefix("Bearer ") else { return false };
-    // Check against the set of issued tokens.
-    state.tokens.lock().await.contains(tok)
+    let mut map = state.tokens.lock().await;
+    // Prune expired tokens opportunistically.
+    map.retain(|_, entry| entry.issued_at.elapsed() < TOKEN_TTL);
+    // Accept only if the token exists and has not expired.
+    map.contains_key(tok)
 }
 
 /// Convenience macro: return `401 UNAUTHORIZED` early if the request lacks a
@@ -175,7 +176,7 @@ pub async fn serve(
     let state = AppState {
         registry,
         config,
-        tokens: Arc::new(Mutex::new(HashSet::new())),
+        tokens: Arc::new(Mutex::new(HashMap::new())),
     };
     let app = Router::new()
         .route("/", get(serve_html))
@@ -184,6 +185,8 @@ pub async fn serve(
         .route("/api/auth", post(api_auth))
         .route("/api/graphs", get(api_graphs).post(api_create_graph))
         .route("/api/graphs/:name", delete(api_drop_graph))
+        .route("/api/locations", get(api_list_locations).post(api_add_location))
+        .route("/api/locations/:path", delete(api_remove_location))
         .route("/api/query", post(api_query))
         .route("/api/viz", post(api_viz))
         .route("/api/upload/nodes", post(api_upload_nodes))
@@ -254,9 +257,12 @@ async fn api_auth(State(s): State<AppState>, Json(body): Json<AuthBody>) -> impl
     }
     match s.config.find_user(&body.user) {
         Some(u) if verify_password(&body.password, &u.password_hash) => {
-            // Credentials valid: generate a token, store it, return it.
+            // Credentials valid: generate a CSPRNG token, store it with issue time, return it.
             let tok = gen_token();
-            s.tokens.lock().await.insert(tok.clone());
+            s.tokens.lock().await.insert(tok.clone(), TokenEntry {
+                _username: body.user.clone(),
+                issued_at: Instant::now(),
+            });
             Json(json!({ "token": tok })).into_response()
         }
         _ => (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid credentials" }))).into_response(),
@@ -318,6 +324,90 @@ async fn api_drop_graph(
     }
 }
 
+// ── /api/locations ────────────────────────────────────────────────────────────
+
+/// `GET /api/locations` — list all registered graph-root directories.
+///
+/// Returns `{"locations": [{"path": "...", "primary": bool}, ...]}` in search
+/// order (primary root first).
+async fn api_list_locations(
+    headers: HeaderMap,
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    auth!(&headers, &s);
+    let locs = s.registry.list_locations().await;
+    let arr: Vec<JsonValue> = locs
+        .into_iter()
+        .map(|(p, primary)| json!({ "path": p.to_string_lossy(), "primary": primary }))
+        .collect();
+    Json(json!({ "locations": arr })).into_response()
+}
+
+/// Request body for `POST /api/locations`.
+#[derive(Deserialize)]
+struct AddLocationBody {
+    path: String,
+}
+
+/// `POST /api/locations` — add a new graph-root directory.
+///
+/// The directory must already exist on the server's filesystem.  Returns `{}`
+/// on success or `400` with `{"error": "..."}` on failure.
+async fn api_add_location(
+    headers: HeaderMap,
+    State(s): State<AppState>,
+    Json(body): Json<AddLocationBody>,
+) -> impl IntoResponse {
+    auth!(&headers, &s);
+    match s.registry.add_location(std::path::PathBuf::from(&body.path)).await {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+/// `DELETE /api/locations/:path` — remove a graph-root directory.
+///
+/// `:path` is URL-encoded.  The primary root cannot be removed.  Returns `{}`
+/// on success or `400` with `{"error": "..."}` on failure.
+async fn api_remove_location(
+    headers: HeaderMap,
+    State(s): State<AppState>,
+    Path(encoded): Path<String>,
+) -> impl IntoResponse {
+    auth!(&headers, &s);
+    // The path arrives percent-encoded; decode it.
+    let decoded = percent_decode(&encoded);
+    match s.registry.remove_location(std::path::Path::new(&decoded)).await {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+/// Percent-decode a URL path segment.
+fn percent_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.bytes().peekable();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h = chars.next().unwrap_or(b'0');
+            let l = chars.next().unwrap_or(b'0');
+            let hex = [h, l];
+            if let Ok(s) = std::str::from_utf8(&hex) {
+                if let Ok(v) = u8::from_str_radix(s, 16) {
+                    out.push(v as char);
+                    continue;
+                }
+            }
+            out.push('%');
+            out.push(h as char);
+            out.push(l as char);
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
 // ── /api/query ────────────────────────────────────────────────────────────────
 
 /// Shared request body for `POST /api/query` and `POST /api/viz`.
@@ -354,7 +444,7 @@ async fn api_query(
     };
     let start = Instant::now();
     let mut guard = arc.lock().await;
-    let (graph, txn_id) = &mut *guard;
+    let GraphState { graph, txn_id, .. } = &mut *guard;
 
     // Handle transaction control keywords before passing to the GQL parser,
     // which does not recognise them as valid statements.
@@ -439,7 +529,7 @@ async fn api_viz(
     };
     let start = Instant::now();
     let mut guard = arc.lock().await;
-    let (graph, txn_id) = &mut *guard;
+    let GraphState { graph, txn_id, .. } = &mut *guard;
     let rows = match crate::query_capturing(&body.query, graph, txn_id) {
         Ok((rows, _)) => rows,
         Err(e) => return Json(json!({ "error": e.to_string() })).into_response(),
@@ -574,9 +664,8 @@ async fn api_upload_nodes(
         Err(e) => return Json(json!({ "error": e.to_string() })).into_response(),
     };
     let mut guard = arc.lock().await;
-    let (graph, _txn_id) = &mut *guard;
 
-    match crate::csv_import::load_nodes_csv(body.csv.as_bytes(), graph, body.label.as_deref()) {
+    match crate::csv_import::load_nodes_csv(body.csv.as_bytes(), &mut guard.graph, body.label.as_deref()) {
         Ok(result) => {
             let id_map_json = crate::csv_import::id_map_to_strings(&result.id_map);
             Json(json!({
@@ -624,7 +713,6 @@ async fn api_upload_edges(
         Err(e) => return Json(json!({ "error": e.to_string() })).into_response(),
     };
     let mut guard = arc.lock().await;
-    let (graph, _txn_id) = &mut *guard;
 
     // Decode id_map from ULID strings to NodeIds.
     let id_map = body.id_map
@@ -632,7 +720,7 @@ async fn api_upload_edges(
         .map(|m| crate::csv_import::id_map_from_strings(m))
         .unwrap_or_default();
 
-    match crate::csv_import::load_edges_csv(body.csv.as_bytes(), graph, &id_map, body.label.as_deref()) {
+    match crate::csv_import::load_edges_csv(body.csv.as_bytes(), &mut guard.graph, &id_map, body.label.as_deref()) {
         Ok(result) => Json(json!({
             "inserted": result.inserted,
             "skipped":  result.skipped,

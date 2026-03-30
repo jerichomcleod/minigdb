@@ -54,7 +54,7 @@ use std::cell::RefCell;
 use crate::graph::Graph;
 use crate::storage::apply_ops;
 use crate::transaction::operation::{Operation, PropertyTarget};
-use crate::types::{ulid_encode, DbError, EdgeId, NodeId, Properties, Value};
+use crate::types::{ulid_encode, DbError, EdgeId, Node, NodeId, Properties, Value};
 
 use super::ast::*;
 
@@ -70,7 +70,13 @@ pub type Row = HashMap<String, Value>;
 /// Values are node/edge IDs so we can look up properties lazily.
 #[derive(Debug, Clone)]
 enum Binding {
+    /// A matched node — its full data was not needed during matching and will
+    /// be loaded lazily on first property access.
     Node(NodeId),
+    /// A matched node whose data was already loaded during constraint checking.
+    /// Carrying the `Node` here avoids a second `get_node` call when the
+    /// executor later evaluates `n.property` expressions.
+    NodeData(NodeId, Node),
     Edge(EdgeId),
     /// Bound by a quantified edge pattern — a list of edge IDs forming the path.
     EdgeList(Vec<EdgeId>),
@@ -119,7 +125,7 @@ pub fn execute_capturing(
         Statement::OptionalMatch(m) => Ok((execute_optional_match(m, graph)?, vec![])),
         Statement::MatchOptionalMatch(m) => Ok((execute_match_optional_match(m, graph)?, vec![])),
         Statement::Unwind(u)        => Ok((execute_unwind(u, graph)?, vec![])),
-        Statement::Union(u)         => Ok((execute_union(u, graph, next_txn_id)?, vec![])),
+        Statement::Union(u)         => execute_union(u, graph, next_txn_id),
         Statement::MatchWith(mw)    => Ok((execute_match_with(mw, graph)?, vec![])),
         Statement::Insert(ins)      => execute_insert(ins, graph, next_txn_id),
         Statement::MatchInsert(mi)  => execute_match_insert(mi, graph, next_txn_id),
@@ -157,6 +163,68 @@ pub fn execute_capturing_with_params(
 
 // ── MATCH ──────────────────────────────────────────────────────────────────
 
+/// O(1) fast path for `MATCH (n:Label) RETURN count(*) [AS alias]` or
+/// `RETURN count(n) [AS alias]` with no WHERE clause and no inline property
+/// constraints on the node pattern.
+///
+/// Returns `Some(rows)` when the query can be answered by a single
+/// `get_label_count_if_known` meta lookup, bypassing pattern matching and
+/// row materialisation entirely.  Returns `None` to fall through to the
+/// normal execution path when:
+///   - multiple patterns or edge steps are present,
+///   - the node has more than one label or inline property constraints,
+///   - a WHERE clause is present,
+///   - the RETURN clause has multiple items or is not a bare `count`,
+///   - the label count has never been written (pre-existing database without counters).
+fn try_label_count_fast_path(m: &MatchStatement, graph: &Graph) -> Option<Vec<Row>> {
+    // Single pattern, no edge steps.
+    if m.patterns.len() != 1 {
+        return None;
+    }
+    let pat = &m.patterns[0];
+    if !pat.steps.is_empty() {
+        return None;
+    }
+
+    // Exactly one label, no inline property constraints.
+    let node = &pat.start;
+    if node.labels.len() != 1 || !node.properties.is_empty() {
+        return None;
+    }
+
+    // No WHERE clause.
+    if m.where_clause.is_some() {
+        return None;
+    }
+
+    // Single RETURN item that is count(*) or count(var).
+    if m.return_clause.items.len() != 1 {
+        return None;
+    }
+    let item = &m.return_clause.items[0];
+    let is_count = match &item.expr {
+        Expr::Call(name, args) if name.eq_ignore_ascii_case("count") => match args.as_slice() {
+            [Expr::Star] => true,
+            [Expr::Var(v)] => node.variable.as_deref() == Some(v.as_str()),
+            _ => false,
+        },
+        _ => false,
+    };
+    if !is_count {
+        return None;
+    }
+
+    let label = &node.labels[0];
+    // Only use the fast path when the counter is known to be initialised.
+    // `None` means the key was never written (pre-existing DB); fall through.
+    let n = graph.store.get_label_count_if_known(label)? as i64;
+    let col = item.alias.clone().unwrap_or_else(|| expr_display(&item.expr));
+
+    let mut row = Row::new();
+    row.insert(col, Value::Int(n));
+    Some(vec![row])
+}
+
 /// Execute a `MATCH … [WHERE] RETURN …` statement.
 ///
 /// Workflow:
@@ -166,10 +234,39 @@ pub fn execute_capturing_with_params(
 ///    otherwise sort by ORDER BY and project each binding via `project_return`.
 /// 4. Apply DISTINCT, then OFFSET and LIMIT.
 fn execute_match(m: MatchStatement, graph: &Graph) -> Result<Vec<Row>, DbError> {
+    // Fast path: MATCH (n:Label) RETURN count(*) / count(n) — O(1) meta lookup.
+    if let Some(rows) = try_label_count_fast_path(&m, graph) {
+        return Ok(rows);
+    }
     // 1. Cross-join all patterns. A single pattern is the common case;
     //    multiple patterns match disconnected subgraphs and combine results as
     //    a Cartesian product (like SQL CROSS JOIN filtered by WHERE).
-    let bindings = cross_join_patterns(&m.patterns, graph, m.path_mode, m.where_clause.as_ref());
+
+    // Compute early-termination limit: usable only when the full result set is
+    // not required — i.e. no ORDER BY, no aggregates, no DISTINCT, no WHERE.
+    // When safe, we pass `offset + limit` into the scan so RocksDB iteration
+    // stops after finding enough candidates rather than reading every node.
+    let has_aggregates = m.return_clause.items.iter().any(|it| contains_aggregate(&it.expr));
+    let early_limit: Option<usize> = if m.where_clause.is_none()
+        && m.return_clause.order_by.is_empty()
+        && !m.return_clause.distinct
+        && !has_aggregates
+    {
+        match m.return_clause.limit.as_ref().and_then(|e| eval_expr_literal(e).ok()) {
+            Some(Value::Int(n)) if n > 0 => {
+                let offset = m.return_clause.offset.as_ref()
+                    .and_then(|e| eval_expr_literal(e).ok())
+                    .and_then(|v| if let Value::Int(o) = v { Some(o.max(0) as usize) } else { None })
+                    .unwrap_or(0);
+                Some((n as usize).saturating_add(offset))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let bindings = cross_join_patterns(&m.patterns, graph, m.path_mode, m.where_clause.as_ref(), early_limit);
 
     // 2. WHERE filter.
     let filtered: Vec<Bindings> = bindings
@@ -186,7 +283,7 @@ fn execute_match(m: MatchStatement, graph: &Graph) -> Result<Vec<Row>, DbError> 
     // 3. Check for aggregate functions in the RETURN clause.
     //    If present, group bindings and compute aggregates; ORDER BY then operates
     //    on the projected rows rather than on raw bindings.
-    let has_aggregates = m.return_clause.items.iter().any(|it| contains_aggregate(&it.expr));
+    // (has_aggregates was already computed above for early_limit eligibility.)
 
     let mut rows: Vec<Row> = if has_aggregates {
         // Aggregate path: group → compute aggregate rows.
@@ -200,7 +297,7 @@ fn execute_match(m: MatchStatement, graph: &Graph) -> Result<Vec<Row>, DbError> 
                 for item in order {
                     let va = eval_expr_on_row(&item.expr, a).unwrap_or(Value::Null);
                     let vb = eval_expr_on_row(&item.expr, b).unwrap_or(Value::Null);
-                    let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let cmp = cmp_nulls_last(&va, &vb);
                     let cmp = if item.ascending { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal {
                         return cmp;
@@ -219,7 +316,7 @@ fn execute_match(m: MatchStatement, graph: &Graph) -> Result<Vec<Row>, DbError> 
                 for item in order {
                     let va = eval_expr(&item.expr, a, graph).unwrap_or(Value::Null);
                     let vb = eval_expr(&item.expr, b, graph).unwrap_or(Value::Null);
-                    let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let cmp = cmp_nulls_last(&va, &vb);
                     let cmp = if item.ascending { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal {
                         return cmp;
@@ -283,7 +380,7 @@ fn execute_match(m: MatchStatement, graph: &Graph) -> Result<Vec<Row>, DbError> 
 /// row so that aggregate functions like `count(*)` still return a result (e.g.
 /// `count(*) = 1`) while non-aggregate columns project to `Null`.
 fn execute_optional_match(m: MatchStatement, graph: &Graph) -> Result<Vec<Row>, DbError> {
-    let bindings = cross_join_patterns(&m.patterns, graph, m.path_mode, m.where_clause.as_ref());
+    let bindings = cross_join_patterns(&m.patterns, graph, m.path_mode, m.where_clause.as_ref(), None);
 
     let filtered: Vec<Bindings> = bindings
         .into_iter()
@@ -319,7 +416,7 @@ fn execute_match_optional_match(
     graph: &Graph,
 ) -> Result<Vec<Row>, DbError> {
     // Phase 1: run the mandatory MATCH.
-    let mut rows: Vec<Bindings> = cross_join_patterns(&m.patterns, graph, m.path_mode, m.where_clause.as_ref());
+    let mut rows: Vec<Bindings> = cross_join_patterns(&m.patterns, graph, m.path_mode, m.where_clause.as_ref(), None);
     if let Some(ref cond) = m.where_clause {
         rows.retain(|b| matches!(eval_expr(cond, b, graph), Ok(Value::Bool(true))));
     }
@@ -388,7 +485,7 @@ fn match_pattern_seeded(
 ) -> Vec<Bindings> {
     // Determine candidate start nodes.
     let start_nodes: Vec<NodeId> = if let Some(ref var) = pattern.start.variable {
-        if let Some(Binding::Node(id)) = seed.get(var.as_str()) {
+        if let Some(Binding::Node(id) | Binding::NodeData(id, _)) = seed.get(var.as_str()) {
             // Already bound — use only that node.
             vec![*id]
         } else {
@@ -399,15 +496,27 @@ fn match_pattern_seeded(
         get_candidate_start_nodes(pattern, graph, where_clause)
     };
 
+    // When the start node carries no constraints beyond what the scan already
+    // guarantees (single label, no inline property predicates), we can skip
+    // loading the full node here and store only the NodeId in the binding.
+    // The node will be loaded lazily on first property access via NodeData.
+    let needs_constraint_check =
+        pattern.start.properties.len() > 0 || pattern.start.labels.len() > 1;
+
     let mut results: Vec<Bindings> = Vec::new();
     for node_id in start_nodes {
-        let node = match graph.get_node(node_id) { Some(n) => n, None => continue };
-        if !check_node_constraints(&pattern.start, &node) { continue; }
+        let start_binding = if needs_constraint_check {
+            let node = match graph.get_node(node_id) { Some(n) => n, None => continue };
+            if !check_node_constraints(&pattern.start, &node) { continue; }
+            Binding::NodeData(node_id, node)
+        } else {
+            Binding::Node(node_id)
+        };
 
         // Start from the seed binding, then add the start node variable.
         let mut binding = seed.clone();
         if let Some(ref var) = pattern.start.variable {
-            binding.insert(var.clone(), Binding::Node(node_id));
+            binding.insert(var.clone(), start_binding);
         }
 
         let mut visited_nodes: HashSet<NodeId> = HashSet::new();
@@ -417,6 +526,7 @@ fn match_pattern_seeded(
         let step_bindings = extend_steps(
             &pattern.steps, node_id, binding, graph,
             path_mode, &visited_edges, &visited_nodes,
+            None,
         );
         results.extend(step_bindings);
     }
@@ -431,23 +541,30 @@ fn match_pattern_seeded(
 
 /// Extract candidate start nodes for a pattern using label/property indexes.
 /// Extracted from `match_pattern` so it can be reused by `match_pattern_seeded`.
+///
+/// Collects candidates from ALL usable indexes (inline constraints + WHERE) and
+/// intersects them — the same logic as the primary `match_pattern` path.
 fn get_candidate_start_nodes(
     pattern: &super::ast::GraphPattern,
     graph: &Graph,
     where_clause: Option<&Expr>,
 ) -> Vec<NodeId> {
     if let Some(primary) = pattern.start.labels.first() {
+        let mut index_sets: Vec<Vec<NodeId>> = Vec::new();
+
         for pc in &pattern.start.properties {
             if let Ok(val) = eval_expr_literal(&pc.value) {
                 if let Some(ids) = graph.lookup_by_property(primary, &pc.key, &val) {
-                    return ids;
+                    index_sets.push(ids);
                 }
             }
         }
         if let (Some(var), Some(where_expr)) = (&pattern.start.variable, where_clause) {
-            if let Some(ids) = range_index_candidates(graph, primary, var, where_expr) {
-                return ids;
-            }
+            collect_where_index_candidates(graph, primary, var, where_expr, &mut index_sets);
+        }
+
+        if !index_sets.is_empty() {
+            return intersect_node_id_sets(index_sets);
         }
         return graph.nodes_by_label(primary);
     }
@@ -498,12 +615,14 @@ fn execute_union(
     u: UnionStatement,
     graph: &mut Graph,
     next_txn_id: &mut u64,
-) -> Result<Vec<Row>, DbError> {
+) -> Result<(Vec<Row>, Vec<crate::transaction::operation::Operation>), DbError> {
     let mut all_rows: Vec<Row> = Vec::new();
+    let mut all_ops:  Vec<crate::transaction::operation::Operation> = Vec::new();
 
     for branch in u.branches {
-        let (rows, _ops) = execute_capturing(branch, graph, next_txn_id)?;
+        let (rows, ops) = execute_capturing(branch, graph, next_txn_id)?;
         all_rows.extend(rows);
+        all_ops.extend(ops);
     }
 
     if !u.all {
@@ -517,7 +636,7 @@ fn execute_union(
         });
     }
 
-    Ok(all_rows)
+    Ok((all_rows, all_ops))
 }
 
 // ── MATCH … WITH … RETURN ──────────────────────────────────────────────────
@@ -535,7 +654,7 @@ fn execute_union(
 /// 6. Final RETURN with ORDER BY / OFFSET / LIMIT.
 fn execute_match_with(mw: MatchWithStatement, graph: &Graph) -> Result<Vec<Row>, DbError> {
     // Phase 1: MATCH → filter by WHERE.
-    let bindings = cross_join_patterns(&mw.patterns, graph, mw.path_mode, mw.where_clause.as_ref());
+    let bindings = cross_join_patterns(&mw.patterns, graph, mw.path_mode, mw.where_clause.as_ref(), None);
 
     let filtered: Vec<Bindings> = bindings
         .into_iter()
@@ -627,7 +746,7 @@ fn apply_return_clause(
                 for item in order {
                     let va = eval_expr_on_row(&item.expr, a).unwrap_or(Value::Null);
                     let vb = eval_expr_on_row(&item.expr, b).unwrap_or(Value::Null);
-                    let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let cmp = cmp_nulls_last(&va, &vb);
                     let cmp = if item.ascending { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal { return cmp; }
                 }
@@ -643,17 +762,31 @@ fn apply_return_clause(
                 for item in order {
                     let va = eval_expr(&item.expr, a, graph).unwrap_or(Value::Null);
                     let vb = eval_expr(&item.expr, b, graph).unwrap_or(Value::Null);
-                    let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let cmp = cmp_nulls_last(&va, &vb);
                     let cmp = if item.ascending { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal { return cmp; }
                 }
                 std::cmp::Ordering::Equal
             });
         }
-        filtered
-            .iter()
-            .map(|b| project_return(&rc.items, b, graph))
-            .collect::<Result<Vec<_>, _>>()?
+        // Parallelize projection for large result sets (PERF-12).
+        // Each call to project_return reads node/edge properties from RocksDB
+        // (or the in-memory adj cache); these are independent reads, so Rayon
+        // can distribute them across available cores.
+        // For small sets the sequential path avoids Rayon thread-dispatch overhead.
+        const PARALLEL_THRESHOLD: usize = 512;
+        if filtered.len() >= PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            filtered
+                .par_iter()
+                .map(|b| project_return(&rc.items, b, graph))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            filtered
+                .iter()
+                .map(|b| project_return(&rc.items, b, graph))
+                .collect::<Result<Vec<_>, _>>()?
+        }
     };
 
     if rc.distinct {
@@ -688,7 +821,7 @@ fn apply_return_clause(
 
 /// The set of aggregate function names recognised by the executor.
 /// The parser lowercases all identifiers, so these are all lowercase.
-const AGG_FUNCTIONS: &[&str] = &["count", "sum", "avg", "min", "max", "collect"];
+const AGG_FUNCTIONS: &[&str] = &["count", "count_distinct", "sum", "avg", "min", "max", "collect"];
 
 /// Returns `true` if `name` is the name of a supported aggregate function.
 fn is_agg_fn(name: &str) -> bool {
@@ -761,6 +894,18 @@ fn aggregate_fn(
                     .count();
                 Ok(Value::Int(n as i64))
             }
+        }
+        "count_distinct" => {
+            let arg = args.first().ok_or_else(|| DbError::Query("count(DISTINCT) requires 1 arg".into()))?;
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for b in group {
+                if let Ok(v) = eval_expr(arg, b, graph) {
+                    if v != Value::Null {
+                        seen.insert(format!("{v:?}"));
+                    }
+                }
+            }
+            Ok(Value::Int(seen.len() as i64))
         }
         "sum" => {
             let arg = args.first().ok_or_else(|| DbError::Query("sum() requires 1 arg".into()))?;
@@ -929,48 +1074,85 @@ fn match_pattern(
     graph: &Graph,
     path_mode: PathMode,
     where_clause: Option<&Expr>,
+    early_limit: Option<usize>,
 ) -> Vec<Bindings> {
     // Use property index for O(1) lookup when available: pick a property constraint
     // whose (label, key, value) is indexed and use that as the candidate set.
     // Fall back to label-index or full scan otherwise.
+    //
+    // When `early_limit` is set and the pattern has no edge steps and no inline
+    // property constraints, we cap the candidate scan at that limit to avoid
+    // reading the entire nodes CF for queries like `MATCH (n) RETURN n LIMIT 1`.
+    let can_limit_candidates = early_limit.is_some()
+        && pattern.steps.is_empty()
+        && pattern.start.properties.is_empty();
+
     let start_nodes: Vec<NodeId> = 'candidates: {
         if let Some(primary) = pattern.start.labels.first() {
-            // 1. Equality property index: inline `{prop: val}` constraints.
+            // 1. Collect candidate sets from every usable index — both inline
+            //    property constraints and WHERE predicates — then intersect
+            //    them.  Using all available indexes is always at least as good
+            //    as using just one: each additional set can only shrink the
+            //    candidate pool.
+            let mut index_sets: Vec<Vec<NodeId>> = Vec::new();
+
+            // 1a. Equality index: inline `{prop: val}` constraints.
             for pc in &pattern.start.properties {
                 if let Ok(val) = eval_expr_literal(&pc.value) {
                     if let Some(ids) = graph.lookup_by_property(primary, &pc.key, &val) {
-                        break 'candidates ids;
+                        index_sets.push(ids);
                     }
                 }
             }
-            // 2. Range property index: extract `n.prop OP literal` from WHERE.
+
+            // 1b. Equality / range / prefix predicates in the WHERE clause.
             if let (Some(var), Some(where_expr)) = (&pattern.start.variable, where_clause) {
-                if let Some(ids) = range_index_candidates(graph, primary, var, where_expr) {
-                    break 'candidates ids;
-                }
+                collect_where_index_candidates(graph, primary, var, where_expr, &mut index_sets);
             }
-            // 3. Label index.
+
+            if !index_sets.is_empty() {
+                break 'candidates intersect_node_id_sets(index_sets);
+            }
+
+            // 2. Label index (with optional limit).
+            if can_limit_candidates {
+                break 'candidates graph.nodes_by_label_limit(primary, early_limit.unwrap());
+            }
             break 'candidates graph.nodes_by_label(primary);
         }
-        // 4. No label — full scan.
-        graph.all_nodes().into_iter().map(|n| n.id).collect()
+        // 3. No label — full scan (with optional limit).
+        if can_limit_candidates {
+            graph.first_n_node_ids(early_limit.unwrap())
+        } else {
+            graph.all_nodes().into_iter().map(|n| n.id).collect()
+        }
     };
+
+    // When the start node carries no constraints beyond what the scan already
+    // guarantees, skip loading the full node during matching.  It will be
+    // loaded (and cached) lazily if a property is accessed later.
+    let needs_constraint_check =
+        pattern.start.properties.len() > 0 || pattern.start.labels.len() > 1;
 
     let mut results: Vec<Bindings> = Vec::new();
 
     for node_id in start_nodes {
-        let node = match graph.get_node(node_id) {
-            Some(n) => n,
-            None => continue,
+        let start_binding = if needs_constraint_check {
+            let node = match graph.get_node(node_id) {
+                Some(n) => n,
+                None => continue,
+            };
+            if !check_node_constraints(&pattern.start, &node) {
+                continue;
+            }
+            Binding::NodeData(node_id, node)
+        } else {
+            Binding::Node(node_id)
         };
-
-        if !check_node_constraints(&pattern.start, &node) {
-            continue;
-        }
 
         let mut binding: Bindings = HashMap::new();
         if let Some(ref var) = pattern.start.variable {
-            binding.insert(var.clone(), Binding::Node(node_id));
+            binding.insert(var.clone(), start_binding);
         }
 
         // Seed the visited sets with the start node.
@@ -978,11 +1160,19 @@ fn match_pattern(
         visited_nodes.insert(node_id);
         let visited_edges: HashSet<EdgeId> = HashSet::new();
 
+        let remaining = early_limit.map(|lim| lim.saturating_sub(results.len()).max(1));
         let step_bindings = extend_steps(
             &pattern.steps, node_id, binding, graph,
             path_mode, &visited_edges, &visited_nodes,
+            remaining,
         );
         results.extend(step_bindings);
+
+        // Early-exit once we have enough results (only safe without WHERE, since
+        // WHERE filtering happens after this function returns in execute_match).
+        if early_limit.is_some_and(|lim| results.len() >= lim) {
+            break;
+        }
     }
 
     results
@@ -1007,6 +1197,7 @@ fn extend_steps(
     path_mode: PathMode,
     visited_edges: &HashSet<EdgeId>,
     visited_nodes: &HashSet<NodeId>,
+    early_limit: Option<usize>,
 ) -> Vec<Bindings> {
     let Some(step) = steps.first() else {
         return vec![binding];
@@ -1016,12 +1207,15 @@ fn extend_steps(
 
     if let Some(quant) = &step.edge.quantifier {
         // ── Variable-length traversal ────────────────────────────────────────
+        // Pass remaining budget into traverse_quantified so BFS terminates
+        // as soon as it has found enough path endpoints.
+        let tq_limit = early_limit.map(|lim| lim.saturating_sub(results.len()).max(1));
         let endpoints = traverse_quantified(
             graph, current_node, &step.edge, quant, path_mode,
-            visited_edges, visited_nodes,
+            visited_edges, visited_nodes, tq_limit,
         );
 
-        for (end_node, edge_path) in endpoints {
+        'tq: for (end_node, edge_path) in endpoints {
             let end_node_data = match graph.get_node(end_node) {
                 Some(n) => n,
                 None => continue,
@@ -1044,73 +1238,97 @@ fn extend_steps(
             new_visited_edges.extend(edge_path.iter().copied());
             new_visited_nodes.insert(end_node);
 
+            let remaining = early_limit.map(|lim| lim.saturating_sub(results.len()).max(1));
             let extended = extend_steps(
                 rest, end_node, new_binding, graph,
                 path_mode, &new_visited_edges, &new_visited_nodes,
+                remaining,
             );
             results.extend(extended);
+            if early_limit.is_some_and(|lim| results.len() >= lim) {
+                break 'tq;
+            }
         }
     } else {
-        // ── Single-hop traversal ─────────────────────────────────────────────
-        // Collect edges incident to current_node in the requested direction.
-        // For EdgeDirection::Either we merge outgoing and incoming and dedup so
-        // that each physical edge is only considered once per step.
-        let edge_ids: Vec<EdgeId> = match step.edge.direction {
-            EdgeDirection::Outgoing => graph.outgoing_edges(current_node),
-            EdgeDirection::Incoming => graph.incoming_edges(current_node),
+        // ── Single-hop traversal (uses in-memory adjacency, ARCH-1) ──────────
+        //
+        // `AdjEntry` carries (edge_id, neighbor, label_id) — no RocksDB lookup
+        // needed for label filtering.  We only call `get_edge` when the pattern
+        // has edge property constraints (uncommon).
+        //
+        // For EdgeDirection::Either we collect both out- and in-adj entries and
+        // dedup by edge_id so each physical edge is visited at most once.
+        use crate::graph::AdjEntry;
+
+        // Build the candidate list.  For Either direction we need owned entries
+        // so we can sort-and-dedup; for single directions we borrow the slice.
+        enum AdjSlice<'s> {
+            Borrowed(&'s [AdjEntry]),
+            Owned(Vec<AdjEntry>),
+        }
+        impl<'s> AdjSlice<'s> {
+            fn iter(&'s self) -> impl Iterator<Item = &'s AdjEntry> {
+                match self {
+                    AdjSlice::Borrowed(s) => s.iter(),
+                    AdjSlice::Owned(v)    => v.iter(),
+                }
+            }
+        }
+
+        let candidates: AdjSlice<'_> = match step.edge.direction {
+            EdgeDirection::Outgoing => AdjSlice::Borrowed(graph.neighbors_out_mem(current_node)),
+            EdgeDirection::Incoming => AdjSlice::Borrowed(graph.neighbors_in_mem(current_node)),
             EdgeDirection::Either => {
-                let mut ids = graph.outgoing_edges(current_node);
-                ids.extend(graph.incoming_edges(current_node));
-                ids.sort();
-                ids.dedup();
-                ids
+                let mut combined: Vec<AdjEntry> = graph
+                    .neighbors_out_mem(current_node)
+                    .iter()
+                    .chain(graph.neighbors_in_mem(current_node).iter())
+                    .cloned()
+                    .collect();
+                // Dedup by edge_id so each undirected edge is only traversed once.
+                combined.sort_by_key(|e| e.edge_id);
+                combined.dedup_by_key(|e| e.edge_id);
+                AdjSlice::Owned(combined)
             }
         };
 
-        for edge_id in edge_ids {
-            let edge = match graph.get_edge(edge_id) {
-                Some(e) => e,
-                None => continue,
-            };
+        for entry in candidates.iter() {
+            let edge_id = entry.edge_id;
 
-            // Filter by optional edge label constraint.
+            // Filter by optional edge label constraint — O(1) interned comparison.
             if let Some(ref lbl) = step.edge.label {
-                if &edge.label != lbl {
+                if graph.adj_label_str(entry.label_id) != lbl.as_str() {
                     continue;
                 }
             }
-            if !check_property_constraints(&step.edge.properties, &edge.properties) {
-                continue;
+
+            // Edge property constraints — load full edge (O(1) in-memory, ARCH-2).
+            if !step.edge.properties.is_empty() {
+                let edge = match graph.get_edge(edge_id) { Some(e) => e, None => continue };
+                if !check_property_constraints(&step.edge.properties, &edge.properties) {
+                    continue;
+                }
             }
 
             // TRAIL mode: each edge may appear at most once in a path.
-            // The `visited_edges` set is cloned per branch so siblings do not
-            // interfere with each other.
             if path_mode == PathMode::Trail && visited_edges.contains(&edge_id) {
                 continue;
             }
 
-            // Determine the node on the other side of this edge.
-            let neighbour = match step.edge.direction {
-                EdgeDirection::Outgoing => edge.to_node,
-                EdgeDirection::Incoming => edge.from_node,
-                EdgeDirection::Either => {
-                    if edge.from_node == current_node { edge.to_node } else { edge.from_node }
-                }
-            };
+            let neighbour = entry.neighbor;
 
             // SIMPLE mode: each node may be visited at most once in a path.
             if path_mode == PathMode::Simple && visited_nodes.contains(&neighbour) {
                 continue;
             }
 
-            let nbr_node = match graph.get_node(neighbour) {
-                Some(n) => n,
-                None => continue,
-            };
-
-            if !check_node_constraints(&step.node, &nbr_node) {
-                continue;
+            // Node constraint check still requires loading the node from RocksDB
+            // (or the in-memory node cache once PERF-6 is implemented).
+            if !step.node.labels.is_empty() || !step.node.properties.is_empty() {
+                let nbr_node = match graph.get_node(neighbour) { Some(n) => n, None => continue };
+                if !check_node_constraints(&step.node, &nbr_node) {
+                    continue;
+                }
             }
 
             let mut new_binding = binding.clone();
@@ -1126,11 +1344,16 @@ fn extend_steps(
             new_visited_edges.insert(edge_id);
             new_visited_nodes.insert(neighbour);
 
+            let remaining = early_limit.map(|lim| lim.saturating_sub(results.len()).max(1));
             let extended = extend_steps(
                 rest, neighbour, new_binding, graph,
                 path_mode, &new_visited_edges, &new_visited_nodes,
+                remaining,
             );
             results.extend(extended);
+            if early_limit.is_some_and(|lim| results.len() >= lim) {
+                break;
+            }
         }
     }
 
@@ -1175,6 +1398,7 @@ fn traverse_quantified(
     path_mode: PathMode,
     prior_visited_edges: &HashSet<EdgeId>,
     prior_visited_nodes: &HashSet<NodeId>,
+    early_limit: Option<usize>,
 ) -> Vec<(NodeId, Vec<EdgeId>)> {
     // Compute the effective upper bound for BFS depth.
     // When no explicit max is given, use a safe upper limit that guarantees
@@ -1216,6 +1440,9 @@ fn traverse_quantified(
         // depth == 0 corresponds to the start node itself (0-hop / * quantifier).
         if state.depth >= min {
             results.push((state.node, state.edge_path.clone()));
+            if early_limit.is_some_and(|lim| results.len() >= lim) {
+                return results;
+            }
         }
 
         // Do not expand beyond the maximum depth.
@@ -1223,51 +1450,50 @@ fn traverse_quantified(
             continue;
         }
 
-        // Gather candidate edges from the current node in the pattern direction.
-        // For EdgeDirection::Either, merge both adjacency lists and dedup.
-        let candidate_edges: Vec<EdgeId> = match edge_pat.direction {
-            EdgeDirection::Outgoing => graph.outgoing_edges(state.node),
-            EdgeDirection::Incoming => graph.incoming_edges(state.node),
+        // Gather candidate adjacency entries from in-memory adj (ARCH-1).
+        // For EdgeDirection::Either, merge both lists and dedup by edge_id.
+        use crate::graph::AdjEntry as TqEntry;
+        let combined_either: Vec<TqEntry>;
+        let candidates: &[TqEntry] = match edge_pat.direction {
+            EdgeDirection::Outgoing => graph.neighbors_out_mem(state.node),
+            EdgeDirection::Incoming => graph.neighbors_in_mem(state.node),
             EdgeDirection::Either => {
-                let mut ids = graph.outgoing_edges(state.node);
-                ids.extend(graph.incoming_edges(state.node));
-                ids.sort();
-                ids.dedup();
-                ids
+                let mut v: Vec<TqEntry> = graph
+                    .neighbors_out_mem(state.node)
+                    .iter()
+                    .chain(graph.neighbors_in_mem(state.node).iter())
+                    .cloned()
+                    .collect();
+                v.sort_by_key(|e| e.edge_id);
+                v.dedup_by_key(|e| e.edge_id);
+                combined_either = v;
+                &combined_either
             }
         };
 
-        for edge_id in candidate_edges {
-            let edge = match graph.get_edge(edge_id) {
-                Some(e) => e,
-                None => continue,
-            };
+        for entry in candidates {
+            let edge_id = entry.edge_id;
 
-            // Apply edge label and property constraints from the pattern.
+            // Label filter: O(1) interned string comparison.
             if let Some(ref lbl) = edge_pat.label {
-                if &edge.label != lbl {
+                if graph.adj_label_str(entry.label_id) != lbl.as_str() {
                     continue;
                 }
             }
-            if !check_property_constraints(&edge_pat.properties, &edge.properties) {
-                continue;
+            // Edge property constraints require a RocksDB lookup (uncommon).
+            if !edge_pat.properties.is_empty() {
+                let edge = match graph.get_edge(edge_id) { Some(e) => e, None => continue };
+                if !check_property_constraints(&edge_pat.properties, &edge.properties) {
+                    continue;
+                }
             }
 
             // TRAIL: skip edges that have already been traversed in this path.
-            // Each QState carries its own visited_edges clone, so sibling BFS
-            // branches are independent.
             if path_mode == PathMode::Trail && state.visited_edges.contains(&edge_id) {
                 continue;
             }
 
-            // Determine the node reached via this edge from the current position.
-            let neighbour = match edge_pat.direction {
-                EdgeDirection::Outgoing => edge.to_node,
-                EdgeDirection::Incoming => edge.from_node,
-                EdgeDirection::Either => {
-                    if edge.from_node == state.node { edge.to_node } else { edge.from_node }
-                }
-            };
+            let neighbour = entry.neighbor;
 
             // SIMPLE: skip nodes that have already been visited in this path.
             if path_mode == PathMode::Simple && state.visited_nodes.contains(&neighbour) {
@@ -1357,7 +1583,7 @@ fn project_return(
                 // Expand all bound variables.
                 for (var, binding) in bindings {
                     match binding {
-                        Binding::Node(id) => {
+                        Binding::Node(id) | Binding::NodeData(id, _) => {
                             row.insert(var.clone(), Value::String(ulid_encode(id.0)));
                         }
                         Binding::Edge(id) => {
@@ -1402,8 +1628,13 @@ fn expr_display(expr: &Expr) -> String {
         Expr::Var(v) => v.clone(),
         Expr::Property(obj, key) => format!("{}.{}", expr_display(obj), key),
         Expr::Call(name, args) => {
-            let arg_strs: Vec<String> = args.iter().map(expr_display).collect();
-            format!("{}({})", name, arg_strs.join(", "))
+            if name == "count_distinct" {
+                let inner = args.first().map(expr_display).unwrap_or_default();
+                format!("count(DISTINCT {inner})")
+            } else {
+                let arg_strs: Vec<String> = args.iter().map(expr_display).collect();
+                format!("{}({})", name, arg_strs.join(", "))
+            }
         }
         Expr::Literal(v) => format!("{v}"),
         Expr::Star => "*".to_string(),
@@ -1426,7 +1657,7 @@ fn eval_expr(expr: &Expr, bindings: &Bindings, graph: &Graph) -> Result<Value, D
         Expr::Literal(v) => Ok(v.clone()),
 
         Expr::Var(name) => match bindings.get(name) {
-            Some(Binding::Node(id)) => Ok(Value::String(ulid_encode(id.0))),
+            Some(Binding::Node(id) | Binding::NodeData(id, _)) => Ok(Value::String(ulid_encode(id.0))),
             Some(Binding::Edge(id)) => Ok(Value::String(ulid_encode(id.0))),
             Some(Binding::EdgeList(ids)) => Ok(Value::List(
                 ids.iter().map(|id| Value::String(ulid_encode(id.0))).collect(),
@@ -1441,6 +1672,10 @@ fn eval_expr(expr: &Expr, bindings: &Bindings, graph: &Graph) -> Result<Value, D
                 _ => return Err(DbError::Query("property access on non-variable".into())),
             };
             match bindings.get(&obj_name) {
+                // Fast path: node data already loaded during matching — no get_node call needed.
+                Some(Binding::NodeData(_, node)) => {
+                    Ok(node.properties.get(key).cloned().unwrap_or(Value::Null))
+                }
                 Some(Binding::Node(id)) => Ok(graph
                     .get_node(*id)
                     .and_then(|n| n.properties.get(key).cloned())
@@ -1558,6 +1793,21 @@ fn eval_expr_on_row(expr: &Expr, row: &Row) -> Result<Value, DbError> {
     }
 }
 
+/// Compare two `Value`s for ORDER BY with NULL-last semantics (SQL standard).
+///
+/// - Both non-null: delegates to `partial_cmp`; NaN/incompatible types → Equal.
+/// - One null: null sorts after any non-null value (Greatest).
+/// - Both null: Equal.
+#[inline]
+fn cmp_nulls_last(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Greater,
+        (_, Value::Null) => std::cmp::Ordering::Less,
+        _ => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+    }
+}
+
 /// Evaluate a binary operator on two already-evaluated `Value`s.
 ///
 /// Comparison operators use `Value::partial_cmp` (which is defined for all
@@ -1633,9 +1883,9 @@ fn numeric_op(
 ///
 /// Aggregate functions (`count`, `sum`, etc.) are **not** handled here —
 /// they are intercepted by `eval_expr_agg` before reaching this function.
-/// If an aggregate name somehow lands here it returns a stub `Int(1)` so that
-/// the aggregate path in `execute_aggregate` still works when evaluating the
-/// first binding of a group for non-aggregate sub-expressions.
+/// If an aggregate name reaches this function it means the query used an
+/// aggregate outside an aggregating RETURN clause, which is a usage error;
+/// an explicit `DbError::Query` is returned rather than a silent stub value.
 fn eval_function(
     name: &str,
     args: &[Expr],
@@ -1643,8 +1893,12 @@ fn eval_function(
     graph: &Graph,
 ) -> Result<Value, DbError> {
     match name {
-        // Stub: real aggregation is handled by eval_expr_agg / execute_aggregate.
-        "count" => Ok(Value::Int(1)),
+        // count() is an aggregate function — it must be handled by eval_expr_agg
+        // before reaching here.  If it lands in eval_function the query has a
+        // bare count() outside an aggregating RETURN, which is a usage error.
+        "count" => Err(DbError::Query(
+            "count() is only valid inside an aggregating RETURN clause".into(),
+        )),
         "id" | "elementid" => {
             let v = eval_expr(args.first().ok_or_else(|| DbError::Query("id() requires 1 arg".into()))?,
                               bindings, graph)?;
@@ -1657,6 +1911,10 @@ fn eval_function(
                 _ => return Err(DbError::Query("labels() requires a node variable".into())),
             };
             match bindings.get(&var) {
+                Some(Binding::NodeData(_, node)) => {
+                    let labels = node.labels.iter().map(|l| Value::String(l.clone())).collect();
+                    Ok(Value::List(labels))
+                }
                 Some(Binding::Node(id)) => {
                     let labels = graph
                         .get_node(*id)
@@ -1992,6 +2250,11 @@ fn eval_function(
             let var = match arg { Expr::Var(v) => v.clone(),
                 _ => return Err(DbError::Query("keys() requires a node or edge variable".into())), };
             match bindings.get(&var) {
+                Some(Binding::NodeData(_, node)) => {
+                    let mut ks: Vec<Value> = node.properties.keys().map(|k| Value::String(k.clone())).collect();
+                    ks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    Ok(Value::List(ks))
+                }
                 Some(Binding::Node(id)) => {
                     let mut ks: Vec<Value> = graph.get_node(*id)
                         .map(|n| n.properties.keys().map(|k| Value::String(k.clone())).collect())
@@ -2196,23 +2459,82 @@ fn execute_insert(
 /// A single pattern is the common case; the identity element is a `vec![{}]`
 /// (one empty binding) so the first pattern's results are passed through
 /// unchanged without an extra copy.
+/// Estimate the number of candidate start nodes for `pattern`.
+///
+/// Lower score = more selective = run first.  Scoring priority (from the plan):
+/// 1. Pattern has an inline `{prop: literal}` constraint on an indexed property
+///    → score 1 (index hit; very selective regardless of total index size).
+/// 2. Pattern has a label with a range-index predicate in WHERE → half of label count.
+/// 3. Pattern has a label → `count_nodes_with_label` (O(1) meta lookup, PERF-9).
+/// 4. No label → full node_count (most expensive).
+///
+/// NOTE: only applies to disconnected comma-separated patterns (what
+/// `cross_join_patterns` handles).  Do NOT apply this to nodes within a single
+/// connected pattern — the graph structure determines their traversal order.
+fn pattern_selectivity(
+    pattern: &GraphPattern,
+    graph: &Graph,
+    where_clause: Option<&Expr>,
+) -> usize {
+    let Some(label) = pattern.start.labels.first() else {
+        return graph.node_count().max(1);
+    };
+
+    // 1. Equality index: inline {prop: literal} → index hit, treat as 1.
+    for pc in &pattern.start.properties {
+        if eval_expr_literal(&pc.value).is_ok()
+            && graph.has_property_index(label, &pc.key)
+        {
+            return 1;
+        }
+    }
+
+    // 2. Range index: WHERE var.prop OP literal on an indexed property.
+    if let (Some(var), Some(where_expr)) = (&pattern.start.variable, where_clause) {
+        for idx_def in &graph.index_defs {
+            if idx_def.label == label.as_str() {
+                let (lo, hi) = extract_prop_range(where_expr, var, &idx_def.property);
+                if lo.is_some() || hi.is_some() {
+                    // Range scan is selective but we don't know the exact count
+                    // without executing the scan.  Use half the label count as
+                    // a pessimistic estimate.
+                    return (graph.count_nodes_with_label(label) / 2).max(1);
+                }
+            }
+        }
+    }
+
+    // 3. Label scan.
+    graph.count_nodes_with_label(label).max(1)
+}
+
 fn cross_join_patterns(
     patterns: &[GraphPattern],
     graph: &Graph,
     mode: PathMode,
     where_clause: Option<&Expr>,
+    early_limit: Option<usize>,
 ) -> Vec<Bindings> {
+    // Sort disconnected patterns by ascending selectivity so the most
+    // constrained (cheapest) pattern drives the outer loop.
+    // This reduces intermediate result sizes and lets early_limit fire sooner.
+    let mut ordered: Vec<&GraphPattern> = patterns.iter().collect();
+    ordered.sort_by_key(|p| pattern_selectivity(p, graph, where_clause));
+
     let mut result: Vec<Bindings> = vec![HashMap::new()];
-    for pattern in patterns {
-        let pattern_bindings = match_pattern(pattern, graph, mode, where_clause);
+    for pattern in ordered {
+        let pattern_bindings = match_pattern(pattern, graph, mode, where_clause, early_limit);
         let mut next: Vec<Bindings> = Vec::new();
-        for existing in &result {
+        'outer: for existing in &result {
             for new_b in &pattern_bindings {
                 let mut merged = existing.clone();
                 for (k, v) in new_b {
                     merged.insert(k.clone(), v.clone());
                 }
                 next.push(merged);
+                if early_limit.is_some_and(|lim| next.len() >= lim) {
+                    break 'outer;
+                }
             }
         }
         result = next;
@@ -2220,28 +2542,122 @@ fn cross_join_patterns(
     result
 }
 
-// ── Range index optimisation helpers ─────────────────────────────────────────
+// ── Index candidate helpers ───────────────────────────────────────────────────
 
-/// For a given start-node `(label, var)`, scan the WHERE clause for range
-/// conditions of the form `var.prop OP literal` and try to use the property
-/// index to pre-filter candidates.  Returns `None` when no range index is
-/// usable.
-fn range_index_candidates<'a>(
-    graph: &'a Graph,
+/// Intersect one or more candidate sets, returning the smallest possible result.
+///
+/// Sets are sorted by length ascending so the smallest set drives the filter
+/// loop.  For a single set the Vec is returned without copying.  Returns an
+/// empty Vec immediately once the running intersection becomes empty.
+fn intersect_node_id_sets(mut sets: Vec<Vec<NodeId>>) -> Vec<NodeId> {
+    debug_assert!(!sets.is_empty());
+    if sets.len() == 1 {
+        return sets.remove(0);
+    }
+    sets.sort_unstable_by_key(|v| v.len());
+    let mut result: HashSet<NodeId> = sets[0].iter().copied().collect();
+    for set in &sets[1..] {
+        if result.is_empty() {
+            return vec![];
+        }
+        let other: HashSet<NodeId> = set.iter().copied().collect();
+        result.retain(|id| other.contains(id));
+    }
+    result.into_iter().collect()
+}
+
+/// Scan the WHERE clause for all index-usable predicates on `(label, var)` and
+/// append one candidate `Vec<NodeId>` per matched predicate into `out`.
+///
+/// The caller gathers results across all indexes (and from inline property
+/// constraints), then intersects them all to obtain the minimal candidate set.
+///
+/// Covers three predicate shapes per indexed property:
+/// 1. Equality: `var.prop = literal`
+/// 2. Range:    `var.prop OP literal` (>, >=, <, <=)
+/// 3. Prefix:   `startsWith(var.prop, "prefix")`
+fn collect_where_index_candidates(
+    graph: &Graph,
     label: &str,
     var: &str,
-    where_expr: &'a Expr,
-) -> Option<Vec<NodeId>> {
+    where_expr: &Expr,
+    out: &mut Vec<Vec<NodeId>>,
+) {
     for idx_def in &graph.index_defs {
         if idx_def.label != label {
             continue;
         }
-        let (lo, hi) = extract_prop_range(where_expr, var, &idx_def.property);
+        let prop = &idx_def.property;
+
+        // Equality is most selective — use it and skip range/prefix for this prop.
+        if let Some(eq_val) = extract_where_equality(where_expr, var, prop) {
+            if let Some(ids) = graph.lookup_by_property(label, prop, eq_val) {
+                out.push(ids);
+                continue;
+            }
+        }
+
+        let (lo, hi) = extract_prop_range(where_expr, var, prop);
         if lo.is_some() || hi.is_some() {
-            return graph.lookup_by_property_range(label, &idx_def.property, lo, hi);
+            if let Some(ids) = graph.lookup_by_property_range(label, prop, lo, hi) {
+                out.push(ids);
+                continue;
+            }
+        }
+
+        if let Some(prefix) = extract_starts_with(where_expr, var, prop) {
+            if let Some(ids) = graph.lookup_by_property_prefix(label, prop, prefix) {
+                out.push(ids);
+            }
         }
     }
-    None
+}
+
+
+/// Extract the literal value from an equality predicate `var.prop = literal`
+/// (or `literal = var.prop`) anywhere in the expression tree (through AND).
+/// Returns `None` if no such predicate is found for this `(var, prop)` pair.
+fn extract_where_equality<'a>(expr: &'a Expr, var: &str, prop: &str) -> Option<&'a Value> {
+    match expr {
+        Expr::BinOp(l, BinOp::And, r) => {
+            extract_where_equality(l, var, prop)
+                .or_else(|| extract_where_equality(r, var, prop))
+        }
+        // var.prop = literal
+        Expr::BinOp(l, BinOp::Eq, r) if is_var_prop(l, var, prop) => {
+            if let Expr::Literal(val) = r.as_ref() { Some(val) } else { None }
+        }
+        // literal = var.prop
+        Expr::BinOp(l, BinOp::Eq, r) if is_var_prop(r, var, prop) => {
+            if let Expr::Literal(val) = l.as_ref() { Some(val) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// Extract the string prefix from a `startsWith(var.prop, "prefix")` call
+/// anywhere in the expression tree (through AND).
+///
+/// Returns `None` if no such call is found for this `(var, prop)` pair.
+fn extract_starts_with<'a>(expr: &'a Expr, var: &str, prop: &str) -> Option<&'a str> {
+    match expr {
+        Expr::BinOp(l, BinOp::And, r) => {
+            extract_starts_with(l, var, prop)
+                .or_else(|| extract_starts_with(r, var, prop))
+        }
+        // startsWith(var.prop, "prefix")
+        Expr::Call(name, args)
+            if name.eq_ignore_ascii_case("startsWith") && args.len() == 2 =>
+        {
+            if is_var_prop(&args[0], var, prop) {
+                if let Expr::Literal(Value::String(s)) = &args[1] {
+                    return Some(s.as_str());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Extract `(lower_bound, upper_bound)` for `var.prop` from a WHERE expression.
@@ -2350,7 +2766,7 @@ fn execute_match_insert(
     next_txn_id: &mut u64,
 ) -> Result<(Vec<Row>, Vec<Operation>), DbError> {
     // Step 1: match all patterns and cross-join the results.
-    let merged = cross_join_patterns(&mi.patterns, graph, PathMode::Walk, mi.where_clause.as_ref());
+    let merged = cross_join_patterns(&mi.patterns, graph, PathMode::Walk, mi.where_clause.as_ref(), None);
 
     // Step 2: apply WHERE filter.
     let filtered: Vec<Bindings> = merged
@@ -2370,7 +2786,7 @@ fn execute_match_insert(
         // Seed var_to_node from the matched nodes in this binding.
         let mut var_to_node: HashMap<String, NodeId> = HashMap::new();
         for (var, b) in binding {
-            if let Binding::Node(id) = b {
+            if let Binding::Node(id) | Binding::NodeData(id, _) = b {
                 var_to_node.insert(var.clone(), *id);
             }
         }
@@ -2398,7 +2814,7 @@ fn execute_set(
     graph: &mut Graph,
     next_txn_id: &mut u64,
 ) -> Result<(Vec<Row>, Vec<Operation>), DbError> {
-    let bindings = match_pattern(&s.match_pattern, graph, PathMode::Walk, s.where_clause.as_ref());
+    let bindings = match_pattern(&s.match_pattern, graph, PathMode::Walk, s.where_clause.as_ref(), None);
 
     let filtered: Vec<Bindings> = bindings
         .into_iter()
@@ -2419,7 +2835,7 @@ fn execute_set(
                 SetItem::Property { variable, key, value } => {
                     let val = eval_expr(value, binding, graph)?;
                     match binding.get(variable) {
-                        Some(Binding::Node(id)) => ops.push(Operation::SetProperty {
+                        Some(Binding::Node(id) | Binding::NodeData(id, _)) => ops.push(Operation::SetProperty {
                             target: PropertyTarget::Node(*id),
                             key: key.clone(),
                             value: val,
@@ -2443,7 +2859,7 @@ fn execute_set(
                     }
                 }
                 SetItem::AddLabel { variable, label } => match binding.get(variable) {
-                    Some(Binding::Node(id)) => ops.push(Operation::AddLabel {
+                    Some(Binding::Node(id) | Binding::NodeData(id, _)) => ops.push(Operation::AddLabel {
                         node_id: *id,
                         label: label.clone(),
                     }),
@@ -2476,7 +2892,7 @@ fn execute_remove(
     graph: &mut Graph,
     next_txn_id: &mut u64,
 ) -> Result<(Vec<Row>, Vec<Operation>), DbError> {
-    let bindings = match_pattern(&r.match_pattern, graph, PathMode::Walk, r.where_clause.as_ref());
+    let bindings = match_pattern(&r.match_pattern, graph, PathMode::Walk, r.where_clause.as_ref(), None);
 
     let filtered: Vec<Bindings> = bindings
         .into_iter()
@@ -2495,7 +2911,7 @@ fn execute_remove(
         for item in &r.items {
             match item {
                 RemoveItem::Property { variable, key } => match binding.get(variable) {
-                    Some(Binding::Node(id)) => ops.push(Operation::RemoveProperty {
+                    Some(Binding::Node(id) | Binding::NodeData(id, _)) => ops.push(Operation::RemoveProperty {
                         target: PropertyTarget::Node(*id),
                         key: key.clone(),
                     }),
@@ -2511,7 +2927,7 @@ fn execute_remove(
                     None => return Err(DbError::Query(format!("variable '{variable}' not bound"))),
                 },
                 RemoveItem::Label { variable, label } => match binding.get(variable) {
-                    Some(Binding::Node(id)) => ops.push(Operation::RemoveLabel {
+                    Some(Binding::Node(id) | Binding::NodeData(id, _)) => ops.push(Operation::RemoveLabel {
                         node_id: *id,
                         label: label.clone(),
                     }),
@@ -2542,7 +2958,7 @@ fn execute_delete(
     graph: &mut Graph,
     next_txn_id: &mut u64,
 ) -> Result<(Vec<Row>, Vec<Operation>), DbError> {
-    let bindings = match_pattern(&d.match_pattern, graph, PathMode::Walk, d.where_clause.as_ref());
+    let bindings = match_pattern(&d.match_pattern, graph, PathMode::Walk, d.where_clause.as_ref(), None);
 
     let filtered: Vec<Bindings> = bindings
         .into_iter()
@@ -2560,7 +2976,7 @@ fn execute_delete(
     for binding in &filtered {
         for var in &d.variables {
             match binding.get(var) {
-                Some(Binding::Node(id)) => {
+                Some(Binding::Node(id) | Binding::NodeData(id, _)) => {
                     if d.detach {
                         ops.push(Operation::DeleteNodeDetach { node_id: *id });
                     } else {
@@ -2601,8 +3017,25 @@ fn execute_create_index(
     graph: &mut Graph,
     next_txn_id: &mut u64,
 ) -> Result<(Vec<Row>, Vec<Operation>), DbError> {
-    let already = graph.has_property_index(&ci.label, &ci.property);
-    graph.apply_create_index(&ci.label, &ci.property);
+    // Determine target: check if label is known as edge label first, then node.
+    // If only one side has the label, use that. If both or neither, default to node.
+    let is_node_label = graph.label_index.contains_key(&ci.label);
+    let is_edge_label = graph.edge_label_index.contains_key(&ci.label);
+    let (already, op) = if is_edge_label && !is_node_label {
+        let already = graph.has_edge_property_index(&ci.label, &ci.property);
+        graph.create_edge_property_index(&ci.label, &ci.property);
+        (already, Operation::CreateIndex {
+            label: ci.label.clone(), property: ci.property.clone(),
+            target: crate::graph::IndexTarget::Edge,
+        })
+    } else {
+        let already = graph.has_property_index(&ci.label, &ci.property);
+        graph.apply_create_index(&ci.label, &ci.property);
+        (already, Operation::CreateIndex {
+            label: ci.label.clone(), property: ci.property.clone(),
+            target: crate::graph::IndexTarget::Node,
+        })
+    };
     let txn_id = *next_txn_id;
     *next_txn_id += 1;
     let msg = if already {
@@ -2610,20 +3043,22 @@ fn execute_create_index(
     } else {
         format!("Index created ON :{}({}) [txn {txn_id}]", ci.label, ci.property)
     };
-    let op = Operation::CreateIndex { label: ci.label, property: ci.property };
     Ok((vec![summary_row(msg)], vec![op]))
 }
 
 /// Execute a `DROP INDEX ON :Label(property)` statement.
-///
-/// If the index did not exist, returns a summary saying so without emitting an
-/// operation.  Otherwise removes it and emits a `DropIndex` operation for WAL.
 fn execute_drop_index(
     di: DropIndexStatement,
     graph: &mut Graph,
     next_txn_id: &mut u64,
 ) -> Result<(Vec<Row>, Vec<Operation>), DbError> {
-    let existed = graph.drop_property_index(&di.label, &di.property);
+    let existed_node = graph.drop_property_index(&di.label, &di.property);
+    let existed_edge = if !existed_node {
+        graph.drop_edge_property_index(&di.label, &di.property)
+    } else {
+        false
+    };
+    let existed = existed_node || existed_edge;
     let txn_id = *next_txn_id;
     *next_txn_id += 1;
     let msg = if existed {
@@ -2638,8 +3073,7 @@ fn execute_drop_index(
 /// Execute a `SHOW INDEXES` statement.
 ///
 /// Returns one row per defined property index with columns `label`, `property`,
-/// and `entries` (number of distinct indexed values).  Returns a single summary
-/// row if no indexes are defined.
+/// `target` (node/edge), and `entries`.
 fn execute_show_indexes(graph: &Graph) -> Result<Vec<Row>, DbError> {
     let indexes = graph.list_property_indexes();
     if indexes.is_empty() {
@@ -2647,10 +3081,11 @@ fn execute_show_indexes(graph: &Graph) -> Result<Vec<Row>, DbError> {
     }
     Ok(indexes
         .into_iter()
-        .map(|(label, property, count)| {
+        .map(|(label, property, count, target)| {
             let mut row = Row::new();
             row.insert("label".to_string(), Value::String(label));
             row.insert("property".to_string(), Value::String(property));
+            row.insert("target".to_string(), Value::String(target));
             row.insert("entries".to_string(), Value::Int(count as i64));
             row
         })
@@ -4302,6 +4737,33 @@ mod tests {
         let rows = run(&mut g, &mut txn, r#"MATCH (n:Num) RETURN count(*)"#).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("count(*)"), Some(&Value::Int(3)));
+    }
+
+    /// count(*) fast path stays accurate after inserts and deletes.
+    #[test]
+    fn count_star_fast_path_tracks_mutations() {
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, r#"INSERT (:Widget {name: "a"})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Widget {name: "b"})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Widget {name: "c"})"#).unwrap();
+
+        let rows = run(&mut g, &mut txn, "MATCH (n:Widget) RETURN count(*) AS c").unwrap();
+        assert_eq!(rows[0].get("c"), Some(&Value::Int(3)));
+
+        run(&mut g, &mut txn, r#"MATCH (n:Widget {name: "b"}) DETACH DELETE n"#).unwrap();
+
+        let rows = run(&mut g, &mut txn, "MATCH (n:Widget) RETURN count(*) AS c").unwrap();
+        assert_eq!(rows[0].get("c"), Some(&Value::Int(2)));
+    }
+
+    /// count(n) (variable form) is equivalent to count(*) for a simple label scan.
+    #[test]
+    fn count_var_fast_path() {
+        let (mut g, mut txn) = three_numbers();
+        let rows = run(&mut g, &mut txn, r#"MATCH (n:Num) RETURN count(n) AS c"#).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("c"), Some(&Value::Int(3)));
     }
 
     /// count(*) with no matches returns 0.
@@ -6855,5 +7317,265 @@ mod tests {
         ).unwrap();
         let err = execute_capturing_with_params(stmt2, &mut g, &mut txn, p);
         assert!(err.is_err(), "parameterized INSERT should be blocked by UNIQUE constraint");
+    }
+
+    // ── AdjDelta rollback tests ───────────────────────────────────────────────
+
+    #[test]
+    fn adj_delta_rollback_insert_edge() {
+        // After BEGIN + insert edge + ROLLBACK, the edge must be gone and the
+        // in-memory adjacency must reflect the pre-transaction state.
+        let dir = tempfile::tempdir().unwrap().into_path();
+        let mut g = Graph::open(&dir).unwrap();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, r#"INSERT (:P {name:"A"})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:P {name:"B"})"#).unwrap();
+
+        g.begin_transaction().unwrap();
+        run(&mut g, &mut txn, r#"MATCH (a:P {name:"A"}),(b:P {name:"B"}) INSERT (a)-[:KNOWS]->(b)"#).unwrap();
+
+        // Edge should exist inside the transaction.
+        let rows_in = run(&mut g, &mut txn, r#"MATCH (a:P)-[:KNOWS]->(b:P) RETURN a.name"#).unwrap();
+        assert_eq!(rows_in.len(), 1);
+
+        g.rollback_transaction().unwrap();
+
+        // Edge must be gone after rollback — both RocksDB and in-memory adj.
+        let rows_after = run(&mut g, &mut txn, r#"MATCH (a:P)-[:KNOWS]->(b:P) RETURN a.name"#).unwrap();
+        assert!(rows_after.is_empty(), "edge should be gone after rollback");
+    }
+
+    #[test]
+    fn adj_delta_rollback_delete_edge() {
+        // After BEGIN + delete edge + ROLLBACK, the edge must be restored.
+        let dir = tempfile::tempdir().unwrap().into_path();
+        let mut g = Graph::open(&dir).unwrap();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, r#"INSERT (:P {name:"A"})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:P {name:"B"})"#).unwrap();
+        run(&mut g, &mut txn, r#"MATCH (a:P {name:"A"}),(b:P {name:"B"}) INSERT (a)-[:KNOWS]->(b)"#).unwrap();
+
+        g.begin_transaction().unwrap();
+        run(&mut g, &mut txn, r#"MATCH ()-[r:KNOWS]->() DELETE r"#).unwrap();
+
+        // Edge gone inside transaction.
+        let rows_in = run(&mut g, &mut txn, r#"MATCH (a)-[r:KNOWS]->(b) RETURN r"#).unwrap();
+        assert!(rows_in.is_empty());
+
+        g.rollback_transaction().unwrap();
+
+        // Edge must be restored after rollback.
+        let rows_after = run(&mut g, &mut txn, r#"MATCH (a:P)-[:KNOWS]->(b:P) RETURN a.name"#).unwrap();
+        assert_eq!(rows_after.len(), 1, "edge should be restored after rollback");
+    }
+
+    // ── STARTS WITH index pushdown tests ─────────────────────────────────────
+
+    fn make_name_graph() -> (Graph, u64) {
+        let dir = tempfile::tempdir().unwrap().into_path();
+        let mut g = Graph::open(&dir).unwrap();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, "CREATE INDEX ON :Person(name)").unwrap();
+        for name in &["Alice", "Albert", "Bob", "Charlie"] {
+            run(&mut g, &mut txn, &format!(r#"INSERT (:Person {{name: "{name}"}})"#)).unwrap();
+        }
+        (g, txn)
+    }
+
+    #[test]
+    fn starts_with_uses_index() {
+        let (mut g, mut txn) = make_name_graph();
+        let rows = run(
+            &mut g, &mut txn,
+            r#"MATCH (n:Person) WHERE startsWith(n.name, "Al") RETURN n.name"#,
+        ).unwrap();
+        let mut names: Vec<String> = col(&rows, "n.name");
+        names.sort();
+        assert_eq!(names, vec![r#""Albert""#, r#""Alice""#]);
+    }
+
+    #[test]
+    fn starts_with_empty_prefix_returns_all() {
+        let (mut g, mut txn) = make_name_graph();
+        let rows = run(
+            &mut g, &mut txn,
+            r#"MATCH (n:Person) WHERE startsWith(n.name, "") RETURN n.name"#,
+        ).unwrap();
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn starts_with_no_match_returns_empty() {
+        let (mut g, mut txn) = make_name_graph();
+        let rows = run(
+            &mut g, &mut txn,
+            r#"MATCH (n:Person) WHERE startsWith(n.name, "Z") RETURN n.name"#,
+        ).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    // ── Multi-index intersection ───────────────────────────────────────────────
+
+    /// Two inline indexed properties → intersection used as candidates.
+    #[test]
+    fn multi_index_inline_two_properties() {
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, "CREATE INDEX ON :Person(name)").unwrap();
+        run(&mut g, &mut txn, "CREATE INDEX ON :Person(dept)").unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Person {name:"Alice", dept:"Eng"})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Person {name:"Alice", dept:"HR"})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Person {name:"Bob",   dept:"Eng"})"#).unwrap();
+        // Only the intersection of name="Alice" ∩ dept="Eng" should match.
+        let rows = run(&mut g, &mut txn,
+            r#"MATCH (n:Person {name:"Alice", dept:"Eng"}) RETURN n.name, n.dept"#).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["n.name"], Value::String("Alice".into()));
+        assert_eq!(rows[0]["n.dept"], Value::String("Eng".into()));
+    }
+
+    /// Two WHERE equality predicates on indexed properties → intersection.
+    #[test]
+    fn multi_index_where_two_equality_predicates() {
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, "CREATE INDEX ON :Item(color)").unwrap();
+        run(&mut g, &mut txn, "CREATE INDEX ON :Item(size)").unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Item {color:"red",  size:"large"})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Item {color:"red",  size:"small"})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Item {color:"blue", size:"large"})"#).unwrap();
+        let rows = run(&mut g, &mut txn,
+            r#"MATCH (n:Item) WHERE n.color = "red" AND n.size = "large" RETURN n.color, n.size"#
+        ).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["n.color"], Value::String("red".into()));
+        assert_eq!(rows[0]["n.size"], Value::String("large".into()));
+    }
+
+    /// Inline indexed property combined with WHERE indexed range → intersection.
+    #[test]
+    fn multi_index_inline_and_where_range() {
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, "CREATE INDEX ON :Employee(dept)").unwrap();
+        run(&mut g, &mut txn, "CREATE INDEX ON :Employee(salary)").unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Employee {dept:"Eng", salary:90000})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Employee {dept:"Eng", salary:50000})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Employee {dept:"HR",  salary:90000})"#).unwrap();
+        // dept="Eng" (inline, indexed) ∩ salary > 80000 (WHERE, indexed)
+        let rows = run(&mut g, &mut txn,
+            r#"MATCH (n:Employee {dept:"Eng"}) WHERE n.salary > 80000 RETURN n.dept, n.salary"#
+        ).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["n.dept"], Value::String("Eng".into()));
+        assert_eq!(rows[0]["n.salary"], Value::Int(90000));
+    }
+
+    /// No intersection when second predicate has no matching nodes → empty result.
+    #[test]
+    fn multi_index_intersection_empty_result() {
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, "CREATE INDEX ON :Widget(color)").unwrap();
+        run(&mut g, &mut txn, "CREATE INDEX ON :Widget(shape)").unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Widget {color:"red",  shape:"circle"})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Widget {color:"blue", shape:"square"})"#).unwrap();
+        let rows = run(&mut g, &mut txn,
+            r#"MATCH (n:Widget {color:"red", shape:"square"}) RETURN n.color"#
+        ).unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn starts_with_combined_with_other_predicate() {
+        // WHERE startsWith(n.name, "Al") AND n.name <> "Alice" → only Albert
+        let (mut g, mut txn) = make_name_graph();
+        let rows = run(
+            &mut g, &mut txn,
+            r#"MATCH (n:Person) WHERE startsWith(n.name, "Al") AND n.name <> "Alice" RETURN n.name"#,
+        ).unwrap();
+        let names: Vec<String> = col(&rows, "n.name");
+        assert_eq!(names, vec![r#""Albert""#]);
+    }
+
+    // ── Order-by NULL semantics (LOW-5) ─────────────────────────────────────
+
+    #[test]
+    fn order_by_null_values_sort_last_asc() {
+        // Nodes with a missing property return NULL for that column.
+        // NULL should sort after all non-NULL values in ASC order (SQL standard).
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "B", rank: 2})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "A", rank: 1})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "C"})"#).unwrap(); // no rank → NULL
+
+        let rows = run(
+            &mut g, &mut txn,
+            "MATCH (n:Item) RETURN n.name ORDER BY n.rank ASC",
+        ).unwrap();
+        let names = col(&rows, "n.name");
+        // A (rank=1) < B (rank=2) < C (rank=NULL) — null must be last in ASC
+        assert_eq!(names[0], r#""A""#, "rank=1 should be first");
+        assert_eq!(names[1], r#""B""#, "rank=2 should be second");
+        assert_eq!(names[2], r#""C""#, "node with null rank should be last in ASC");
+    }
+
+    #[test]
+    fn order_by_null_values_sort_first_desc() {
+        // In DESC order the comparator is reversed, so NULL-last in ASC becomes
+        // NULL-first in DESC (same as standard SQL behavior).
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "B", rank: 2})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "A", rank: 1})"#).unwrap();
+        run(&mut g, &mut txn, r#"INSERT (:Item {name: "C"})"#).unwrap(); // no rank → NULL
+
+        let rows = run(
+            &mut g, &mut txn,
+            "MATCH (n:Item) RETURN n.name ORDER BY n.rank DESC",
+        ).unwrap();
+        let names = col(&rows, "n.name");
+        // DESC reversal: NULL (Greater when ASC) → first; then rank=2, then rank=1
+        assert_eq!(names[0], r#""C""#, "node with null rank should be first in DESC");
+        assert_eq!(names[1], r#""B""#, "rank=2 should be second");
+        assert_eq!(names[2], r#""A""#, "rank=1 should be last");
+    }
+
+    // ── count() outside aggregate context (LOW-2) ────────────────────────────
+
+    #[test]
+    fn count_outside_aggregating_return_errors() {
+        // count() is an aggregate function — using it in a non-aggregate context
+        // (e.g. as an argument to another function) should surface an error rather
+        // than silently returning 1 (the old stub behavior).
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(&mut g, &mut txn, r#"INSERT (:X {v: 1})"#).unwrap();
+        // Bare count() used as an argument to toString() bypasses the aggregate
+        // path and should hit the explicit error in eval_function.
+        let result = run(&mut g, &mut txn, "MATCH (n:X) RETURN toString(count(n)) AS s");
+        assert!(result.is_err(), "count() outside aggregate RETURN must error");
+    }
+
+    // ── UNION write persistence (HIGH-2) ─────────────────────────────────────
+
+    #[test]
+    fn union_insert_branches_both_execute() {
+        // Each branch of a UNION is a valid single_stmt, including INSERT.
+        // Previously, ops from UNION branches were discarded — the in-memory
+        // write happened but no Operation was recorded, so the node would
+        // vanish on rollback and not be WAL-logged.
+        //
+        // After the fix, ops from both branches are collected and returned to
+        // the caller.  Both inserts must be visible in subsequent queries.
+        let mut g = Graph::new();
+        let mut txn = 0u64;
+        run(
+            &mut g, &mut txn,
+            r#"INSERT (:Tag {name: "alpha"}) UNION ALL INSERT (:Tag {name: "beta"})"#,
+        ).unwrap();
+        let rows = run(&mut g, &mut txn, "MATCH (n:Tag) RETURN n.name").unwrap();
+        assert_eq!(rows.len(), 2, "both UNION INSERT branches must produce visible nodes");
     }
 }

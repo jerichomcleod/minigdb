@@ -282,6 +282,7 @@ list_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
 
 primary = {
     "(" ~ expr ~ ")"
+  | count_distinct_call  // must precede func_call — count(DISTINCT expr)
   | func_call
   | list_literal
   | literal
@@ -294,6 +295,10 @@ primary = {
 // ── Query parameter ─────────────────────────────────────────────────────────
 // $ident — reference to a named parameter passed alongside the query.
 param = @{ "$" ~ ident }
+
+// count(DISTINCT expr) — standard GQL/SQL set-quantifier form.
+// Must precede func_call so DISTINCT is not parsed as an expression.
+count_distinct_call = { ^"count" ~ "(" ~ kw_distinct ~ expr ~ ")" }
 
 func_call   = { ident ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
 prop_access = { ident ~ "." ~ ident }

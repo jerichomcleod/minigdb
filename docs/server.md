@@ -18,12 +18,18 @@ cargo run -- serve --no-auth
 # Custom host/port
 cargo run -- serve --host 0.0.0.0 --port 7474 --gui-port 8080
 
+# Add an extra graph-root directory for this session only (may be repeated)
+cargo run -- serve --graphs-dir /path/to/my/graphs
+
 # Flags:
-#   --host <addr>       bind address for TCP API    (default: 127.0.0.1)
-#   --port <port>       TCP API port                (default: 7474)
-#   --gui-port <port>   HTTP web GUI port           (default: 7475)
-#   --no-auth           disable authentication
-#   --no-gui            disable the web GUI
+#   --host <addr>          bind address for TCP API    (default: 127.0.0.1)
+#   --port <port>          TCP API port                (default: 7474)
+#   --gui-port <port>      HTTP web GUI port           (default: 7475)
+#   --no-auth              disable authentication
+#   --no-gui               disable the web GUI
+#   --graphs-dir <path>    add a session-only extra graph-root directory
+#                          (may be repeated; use :add-location or the GUI
+#                           Locations panel to persist across restarts)
 ```
 
 The server checkpoints all open graphs and exits cleanly on `Ctrl-C`.
@@ -86,6 +92,12 @@ Open **http://localhost:7475** in a browser. The GUI is a dark single-page app p
 - Switch between named graphs from the dropdown in the header
 - Create or drop graphs directly from the GUI
 
+**Locations panel (⊞ Locations button):**
+- Lists all registered graph-root directories; the primary root is labelled
+- Add a new root directory by typing an absolute path and clicking Add
+- Remove any non-primary root with the ✕ button
+- Changes are persisted to `<data_dir>/locations.toml` and take effect immediately
+
 **Authentication:**
 - Login form shown automatically if the server has auth enabled
 - Session token stored in `sessionStorage`
@@ -143,6 +155,15 @@ Each connection holds an exclusive per-graph lock for the duration of a transact
 
 {"type":"admin","cmd":"stats"}
 → {"type":"admin_ok","open_graphs":["default"]}
+
+{"type":"admin","cmd":"locations"}
+→ {"type":"admin_ok","locations":[{"path":"/data/graphs","primary":true}]}
+
+{"type":"admin","cmd":"add_location","path":"/mnt/shared/graphs"}
+→ {"type":"admin_ok"}
+
+{"type":"admin","cmd":"remove_location","path":"/mnt/shared/graphs"}
+→ {"type":"admin_ok"}
 ```
 
 ---
@@ -171,5 +192,8 @@ The web GUI server also exposes a REST API (used internally by the GUI):
 | `DELETE` | `/api/graphs/:name` | Drop a graph |
 | `POST` | `/api/query` | Run GQL: `{graph?, query}` → `{rows, elapsed_ms}` |
 | `POST` | `/api/viz` | Visualize: `{graph?, query}` → `{rows, nodes, edges}` — automatically resolves ULID strings in results to full node/edge records |
+| `GET` | `/api/locations` | List graph-root directories: `{locations: [{path, primary}]}` |
+| `POST` | `/api/locations` | Add a root: `{path}` |
+| `DELETE` | `/api/locations/:path` | Remove a root (percent-encoded path) |
 | `POST` | `/api/upload/nodes` | CSV node import: `{csv, graph?, label?}` → `{inserted, id_map}` |
 | `POST` | `/api/upload/edges` | CSV edge import: `{csv, id_map, graph?, label?}` → `{inserted, skipped}` |

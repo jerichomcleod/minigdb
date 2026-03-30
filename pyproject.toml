@@ -4,9 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "minigdb"
-version = "0.1.1"
+version = "0.1.2"
 requires-python = ">=3.8"
-description = "Embeddable property graph database with GQL — the SQLite for graphs"
+description = "Embeddable property graph database with GQL query language, graph algorithms, and Python bindings"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Jericho McLeod" }]

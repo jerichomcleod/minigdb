@@ -45,7 +45,7 @@
 //! Negative edge weights are rejected with an error.  For graphs with negative
 //! weights consider a Bellman-Ford variant.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::cmp::Reverse;
 
 use crate::graph::Graph;
@@ -82,6 +82,26 @@ pub fn run(graph: &Graph, params: &HashMap<String, Value>) -> Result<Vec<Row>, D
 
     if max_cost < 0.0 {
         return Err(DbError::Query("parameter 'maxCost' must be non-negative".into()));
+    }
+
+    // For unweighted single-pair queries on larger graphs, bidirectional BFS
+    // halves the search frontier and avoids Dijkstra's heap overhead entirely.
+    if weight_prop.is_none() && max_cost.is_infinite() {
+        if let Some(t) = target {
+            if snap.n >= 64 {
+                return Ok(match bidirectional_bfs(&snap, source, t, direction) {
+                    Some((cost, path)) => {
+                        let mut row = HashMap::new();
+                        row.insert("source".to_string(), Value::String(ulid_encode(snap.node_ids[source].0)));
+                        row.insert("target".to_string(), Value::String(ulid_encode(snap.node_ids[t].0)));
+                        row.insert("cost".to_string(), Value::Float(cost));
+                        row.insert("path".to_string(), Value::List(path));
+                        vec![row]
+                    }
+                    None => vec![],
+                });
+            }
+        }
     }
 
     dijkstra(&snap, source, target, direction, max_cost)
@@ -212,6 +232,134 @@ fn reconstruct_path(
     // Path was built target → source; reverse to get source → target order.
     path.reverse();
     path
+}
+
+// ── Bidirectional BFS ─────────────────────────────────────────────────────────
+
+/// Bidirectional BFS for unweighted single-pair shortest paths.
+///
+/// Simultaneously expands frontiers from `source` (forward) and `target`
+/// (backward), alternating one node at a time.  Each side terminates when its
+/// current-frontier distance equals or exceeds the best-known path length,
+/// cutting the average search space roughly in half versus single-directional BFS.
+///
+/// Returns `Some((hop_count, path_as_ulid_list))` if a path exists,
+/// `None` if source and target are not connected.
+///
+/// # Correctness
+///
+/// When adding a newly-discovered node `v` to either frontier, we immediately
+/// check whether `v` has already been reached by the opposing frontier.  Any
+/// path cost discovered this way updates `best`.  The termination guard
+/// `dist_f[u] >= best` (and similarly for backward) ensures that no
+/// improvement can be found once the current expansion depth matches or exceeds
+/// the best path length.
+fn bidirectional_bfs(
+    snap: &GraphSnapshot,
+    source: usize,
+    target: usize,
+    dir: Direction,
+) -> Option<(f64, Vec<Value>)> {
+    if source == target {
+        return Some((
+            0.0,
+            vec![Value::String(ulid_encode(snap.node_ids[source].0))],
+        ));
+    }
+
+    let n = snap.n;
+    const INF: usize = usize::MAX;
+
+    let mut dist_f = vec![INF; n];
+    let mut dist_b = vec![INF; n];
+    let mut prev_f: Vec<Option<usize>> = vec![None; n];
+    let mut prev_b: Vec<Option<usize>> = vec![None; n];
+
+    dist_f[source] = 0;
+    dist_b[target] = 0;
+
+    let mut qf: VecDeque<usize> = VecDeque::from([source]);
+    let mut qb: VecDeque<usize> = VecDeque::from([target]);
+
+    // Reverse direction: forward follows `dir`, backward follows the opposite.
+    let rev = match dir {
+        Direction::Out => Direction::In,
+        Direction::In => Direction::Out,
+        Direction::Any => Direction::Any,
+    };
+
+    let mut best = INF; // best total path length found so far
+
+    while !qf.is_empty() || !qb.is_empty() {
+        // Expand one node from the forward frontier.
+        if let Some(u) = qf.pop_front() {
+            if dist_f[u] >= best {
+                continue; // can't improve: any extension costs ≥ best
+            }
+            for (v, _) in snap.neighbors(u, dir) {
+                if dist_f[v] == INF {
+                    dist_f[v] = dist_f[u] + 1;
+                    prev_f[v] = Some(u);
+                    if dist_b[v] != INF {
+                        best = best.min(dist_f[v] + dist_b[v]);
+                    }
+                    qf.push_back(v);
+                }
+            }
+        }
+
+        // Expand one node from the backward frontier.
+        if let Some(u) = qb.pop_front() {
+            if dist_b[u] >= best {
+                continue;
+            }
+            for (v, _) in snap.neighbors(u, rev) {
+                if dist_b[v] == INF {
+                    dist_b[v] = dist_b[u] + 1;
+                    prev_b[v] = Some(u);
+                    if dist_f[v] != INF {
+                        best = best.min(dist_f[v] + dist_b[v]);
+                    }
+                    qb.push_back(v);
+                }
+            }
+        }
+    }
+
+    if best == INF {
+        return None; // no path from source to target
+    }
+
+    // Find the meeting node that achieves the minimum combined distance.
+    let meet = (0..n).find(|&u| {
+        dist_f[u] != INF && dist_b[u] != INF && dist_f[u] + dist_b[u] == best
+    })?;
+
+    // Reconstruct: source → meet via forward predecessors.
+    let mut path = vec![];
+    let mut curr = meet;
+    loop {
+        path.push(Value::String(ulid_encode(snap.node_ids[curr].0)));
+        match prev_f[curr] {
+            Some(p) => curr = p,
+            None => break,
+        }
+    }
+    path.reverse(); // now source → meet
+
+    // Append meet → target via backward predecessors.
+    curr = meet;
+    loop {
+        match prev_b[curr] {
+            Some(p) => {
+                curr = p;
+                path.push(Value::String(ulid_encode(snap.node_ids[curr].0)));
+            }
+            None => break,
+        }
+    }
+
+    Some((best as f64, path))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -31,7 +31,9 @@ pub fn ulid_new() -> u128 {
     let ts_ms = (now.as_millis() as u128) & 0xFFFF_FFFF_FFFFu128;
 
     // Monotonic counter for within-millisecond uniqueness.
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u128;
+    // AcqRel: the increment is visible to all threads before any subsequent
+    // ID-dependent operation reads it, ensuring no two threads get the same seq.
+    let seq = SEQ.fetch_add(1, Ordering::AcqRel) as u128;
 
     // Sub-millisecond nanos add entropy so IDs from different processes
     // (same counter value) are still distinct.

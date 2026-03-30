@@ -21,15 +21,18 @@
 //!
 //! ## Graph management meta-commands (always single-line, prefix `:`)
 //!
-//! | Command               | Effect                                         |
-//! |-----------------------|------------------------------------------------|
-//! | `:graphs`             | List all named graphs; mark the active one     |
-//! | `:create <name>`      | Create a new graph and switch to it            |
-//! | `:use <name>`         | Switch to an existing graph                    |
-//! | `:drop <name>`        | Permanently delete a graph (must not be active)|
-//! | `:clear`              | Delete all nodes and edges in O(1)             |
-//! | `:checkpoint`         | Flush WAL to RocksDB SST files immediately     |
-//! | `:quit` / `:exit` / `:q` | Exit the REPL cleanly                       |
+//! | Command                      | Effect                                            |
+//! |------------------------------|---------------------------------------------------|
+//! | `:graphs`                    | List all named graphs across all roots            |
+//! | `:create <name>`             | Create a new graph in the primary root            |
+//! | `:use <name>`                | Switch to an existing graph (searches all roots)  |
+//! | `:drop <name>`               | Permanently delete a graph (must not be active)   |
+//! | `:clear`                     | Delete all nodes and edges in O(1)                |
+//! | `:checkpoint`                | Flush WAL to RocksDB SST files immediately        |
+//! | `:locations`                 | List registered graph-root directories            |
+//! | `:add-location <path>`       | Register a new root directory (persisted)         |
+//! | `:remove-location <path>`    | Remove a registered root directory (persisted)    |
+//! | `:quit` / `:exit` / `:q`    | Exit the REPL cleanly                             |
 //!
 //! ## Transaction control (GQL keywords)
 //!
@@ -44,10 +47,15 @@
 //!
 //! # Named graph storage layout
 //!
-//! All graphs live under `<data_root>/graphs/`:
+//! The *primary* graph root lives under `<data_root>/graphs/`:
 //! - Linux:   `~/.local/share/minigdb/graphs/`
 //! - macOS:   `~/Library/Application Support/minigdb/graphs/`
 //! - Windows: `%APPDATA%\minigdb\graphs\`
+//!
+//! Additional root directories can be registered via `:add-location <path>` and
+//! are persisted to `<data_root>/locations.toml`.  The REPL searches all roots
+//! in order (primary first) when looking up a graph by name.  New graphs are
+//! always created in the primary root.
 //!
 //! Each graph occupies its own subdirectory, which RocksDB uses as its data
 //! directory.  Switching graphs closes the current RocksDB instance (via
@@ -99,6 +107,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graphs_dir = data_root.join("graphs");
     std::fs::create_dir_all(&graphs_dir)?;
 
+    // Build the ordered list of graph-root directories: primary first, then
+    // any extra roots from locations.toml.  This list is mutated at runtime
+    // by :add-location / :remove-location.
+    #[cfg(feature = "server")]
+    let mut roots: Vec<std::path::PathBuf> = {
+        let mut v = vec![graphs_dir.clone()];
+        v.extend(minigdb::server::locations::LocationsConfig::load(&data_root).paths());
+        v
+    };
+    #[cfg(not(feature = "server"))]
+    let roots: Vec<std::path::PathBuf> = vec![graphs_dir.clone()];
+
     // Open (or create) the default graph on startup.
     let mut current_graph_name = String::from("default");
     let (mut storage, mut graph) = open_graph(&graphs_dir, &current_graph_name)
@@ -112,6 +132,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Type GQL queries (end with ';'), or :quit / :exit to exit.");
     println!("Transaction commands: BEGIN, COMMIT, ROLLBACK");
     println!("Graph commands: :graphs  :create <name>  :use <name>  :drop <name>  :clear");
+    #[cfg(feature = "server")]
+    println!("Location commands: :locations  :add-location <path>  :remove-location <path>");
     println!();
 
     // ── Rustyline setup ───────────────────────────────────────────────────────
@@ -189,8 +211,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     if cmd.eq_ignore_ascii_case(":graphs") {
-                        // List all subdirectories of graphs_dir, alphabetically sorted.
-                        let names = list_graph_names(&graphs_dir);
+                        // List all subdirectories across all roots, alphabetically sorted.
+                        let names = list_graph_names_multi(&roots);
                         if names.is_empty() {
                             println!("(no graphs)");
                         } else {
@@ -227,22 +249,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if !validate_graph_name(name) {
                             eprintln!("Error: invalid graph name '{}'", name);
                         } else {
-                            let graph_path = graphs_dir.join(name);
-                            if !graph_path.exists() {
-                                eprintln!("Error: graph '{}' does not exist (use :create to create it)", name);
-                            } else {
-                                // Checkpoint current graph before switching.
-                                if let Err(e) = storage.checkpoint(&graph) {
-                                    eprintln!("Warning: could not checkpoint current graph: {e}");
-                                }
-                                match open_graph(&graphs_dir, name) {
-                                    Ok((new_storage, new_graph)) => {
-                                        storage = new_storage;
-                                        graph = new_graph;
-                                        current_graph_name = name.to_string();
-                                        println!("Switched to graph '{}'.", name);
+                            match find_graph_path(name, &roots) {
+                                None => eprintln!("Error: graph '{}' does not exist (use :create to create it)", name),
+                                Some(graph_path) => {
+                                    // Checkpoint current graph before switching.
+                                    if let Err(e) = storage.checkpoint(&graph) {
+                                        eprintln!("Warning: could not checkpoint current graph: {e}");
                                     }
-                                    Err(e) => eprintln!("Error opening graph '{}': {}", name, e),
+                                    match minigdb::StorageManager::open(&graph_path) {
+                                        Ok((new_storage, new_graph)) => {
+                                            storage = new_storage;
+                                            graph = new_graph;
+                                            current_graph_name = name.to_string();
+                                            println!("Switched to graph '{}'.", name);
+                                        }
+                                        Err(e) => eprintln!("Error opening graph '{}': {}", name, e),
+                                    }
                                 }
                             }
                         }
@@ -255,13 +277,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // a graph; require the user to switch away first.
                             eprintln!("Error: cannot drop the active graph (switch to another graph first)");
                         } else {
-                            let graph_path = graphs_dir.join(name);
-                            if !graph_path.exists() {
-                                eprintln!("Error: graph '{}' does not exist", name);
-                            } else {
-                                match std::fs::remove_dir_all(&graph_path) {
-                                    Ok(_) => println!("Dropped graph '{}'.", name),
-                                    Err(e) => eprintln!("Error dropping graph '{}': {}", name, e),
+                            match find_graph_path(name, &roots) {
+                                None => eprintln!("Error: graph '{}' does not exist", name),
+                                Some(graph_path) => {
+                                    match std::fs::remove_dir_all(&graph_path) {
+                                        Ok(_) => println!("Dropped graph '{}'.", name),
+                                        Err(e) => eprintln!("Error dropping graph '{}': {}", name, e),
+                                    }
                                 }
                             }
                         }
@@ -274,8 +296,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Err(e) => eprintln!("Error: {e}"),
                             }
                         }
+                    } else if cmd.eq_ignore_ascii_case(":locations") {
+                        println!("  {} (primary)", graphs_dir.display());
+                        for root in roots.iter().skip(1) {
+                            println!("  {}", root.display());
+                        }
+                    } else if let Some(rest) = cmd.strip_prefix(":add-location ").or_else(|| cmd.strip_prefix(":ADD-LOCATION ")) {
+                        let path = std::path::PathBuf::from(rest.trim());
+                        if !path.is_dir() {
+                            eprintln!("Error: '{}' does not exist or is not a directory", path.display());
+                        } else if roots.contains(&path) {
+                            eprintln!("Error: '{}' is already registered", path.display());
+                        } else {
+                            #[cfg(feature = "server")]
+                            {
+                                let mut cfg = minigdb::server::locations::LocationsConfig::load(&data_root);
+                                cfg.add(path.clone());
+                                match cfg.save(&data_root) {
+                                    Ok(_) => {
+                                        roots.push(path.clone());
+                                        println!("Added location '{}'.", path.display());
+                                    }
+                                    Err(e) => eprintln!("Error saving locations: {e}"),
+                                }
+                            }
+                            #[cfg(not(feature = "server"))]
+                            eprintln!("Error: location persistence requires the 'server' feature");
+                        }
+                    } else if let Some(rest) = cmd.strip_prefix(":remove-location ").or_else(|| cmd.strip_prefix(":REMOVE-LOCATION ")) {
+                        let path = std::path::PathBuf::from(rest.trim());
+                        if path == graphs_dir {
+                            eprintln!("Error: cannot remove the primary graph root");
+                        } else if !roots.contains(&path) {
+                            eprintln!("Error: '{}' is not a registered location", path.display());
+                        } else {
+                            #[cfg(feature = "server")]
+                            {
+                                let mut cfg = minigdb::server::locations::LocationsConfig::load(&data_root);
+                                cfg.remove(&path);
+                                match cfg.save(&data_root) {
+                                    Ok(_) => {
+                                        roots.retain(|p| p != &path);
+                                        println!("Removed location '{}'.", path.display());
+                                    }
+                                    Err(e) => eprintln!("Error saving locations: {e}"),
+                                }
+                            }
+                            #[cfg(not(feature = "server"))]
+                            eprintln!("Error: location persistence requires the 'server' feature");
+                        }
                     } else {
-                        eprintln!("Unknown command: '{}'. Type :graphs, :create <name>, :use <name>, :drop <name>, :clear.", cmd);
+                        eprintln!("Unknown command: '{}'. Type :graphs, :create <name>, :use <name>, :drop <name>, :clear, :locations, :add-location <path>, :remove-location <path>.", cmd);
                     }
 
                     rl.add_history_entry(trimmed)?;
@@ -422,30 +493,42 @@ fn open_graph(
     minigdb::StorageManager::open(&graph_path)
 }
 
-/// List all graph names (subdirectories of `graphs_dir`), sorted alphabetically.
-///
-/// Plain files in `graphs_dir` are silently ignored.  Returns an empty `Vec`
-/// if `graphs_dir` cannot be read (e.g. does not exist yet).
-#[cfg(any(feature = "repl", test))]
-fn list_graph_names(graphs_dir: &std::path::Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(graphs_dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(|e| {
-            let e = e.ok()?;
-            // Only include actual directories — filter out regular files.
-            // Names starting with '_' are reserved system graphs; exclude them.
-            if e.file_type().ok()?.is_dir() {
-                let name = e.file_name().into_string().ok()?;
-                if name.starts_with('_') { None } else { Some(name) }
-            } else {
-                None
+/// List all graph names across multiple root directories, deduplicating by
+/// first-root-wins.  System graphs (names starting with `_`) are excluded.
+/// Returns names sorted alphabetically.
+#[cfg(feature = "repl")]
+fn list_graph_names_multi(roots: &[std::path::PathBuf]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else { continue };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_dir() { continue }
+            let Ok(name) = entry.file_name().into_string() else { continue };
+            if name.starts_with('_') { continue }
+            // Only list directories that contain a RocksDB database.
+            if !entry.path().join("CURRENT").is_file() { continue }
+            if seen.insert(name.clone()) {
+                names.push(name);
             }
-        })
-        .collect();
+        }
+    }
     names.sort();
     names
+}
+
+/// Search `roots` in order for a subdirectory named `name`.
+/// Returns the first matching path, or `None` if not found in any root.
+#[cfg(feature = "repl")]
+fn find_graph_path(name: &str, roots: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    for root in roots {
+        let candidate = root.join(name);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Return `true` if `name` is a valid graph (or username) identifier.
@@ -655,6 +738,8 @@ fn serve_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut no_auth = false;
     // GUI is enabled by default on port 7475; pass `--no-gui` to disable.
     let mut gui_port: Option<u16> = Some(7475);
+    // Session-only extra graph-root directories (not persisted to locations.toml).
+    let mut session_roots: Vec<std::path::PathBuf> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -680,27 +765,45 @@ fn serve_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         .ok_or("--gui-port requires a numeric value")?,
                 );
             }
+            "--graphs-dir" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--graphs-dir requires a path value")?;
+                let p = std::path::PathBuf::from(raw);
+                if !p.is_dir() {
+                    return Err(format!(
+                        "--graphs-dir '{}' does not exist or is not a directory",
+                        p.display()
+                    ).into());
+                }
+                session_roots.push(p);
+            }
             "--help" | "-h" => {
-                eprintln!(
-                    "Usage: minigdb serve [--host <addr>] [--port <port>] [--no-auth] [--gui-port <port>] [--no-gui]\n\
-                     \n\
-                     Options:\n\
-                       --host           Bind address        (default: 127.0.0.1)\n\
-                       --port, -p       TCP port            (default: 7474)\n\
-                       --no-auth        Disable authentication\n\
-                       --gui-port       HTTP GUI port       (default: 7475)\n\
-                       --no-gui         Disable the web GUI\n\
-                     \n\
-                     User management:\n\
-                       minigdb adduser <name>   Add a new user\n\
-                       minigdb passwd <name>    Change a user's password\n\
-                       minigdb users            List all users\n\
-                     \n\
-                     Protocol v2: newline-delimited JSON over TCP.\n\
-                     Server sends hello on connect, then client may auth, then queries.\n\
-                     Request:  {{\"id\":1,\"query\":\"MATCH (n) RETURN n\"}}\n\
-                     Response: {{\"id\":1,\"rows\":[...],\"elapsed_ms\":0.3}}"
-                );
+                eprintln!(concat!(
+                    "Usage: minigdb serve [--host <addr>] [--port <port>] [--no-auth]\n",
+                    "                     [--gui-port <port>] [--no-gui]\n",
+                    "                     [--graphs-dir <path>] ...\n",
+                    "\n",
+                    "Options:\n",
+                    "  --host               Bind address           (default: 127.0.0.1)\n",
+                    "  --port, -p           TCP port               (default: 7474)\n",
+                    "  --no-auth            Disable authentication\n",
+                    "  --gui-port           HTTP GUI port          (default: 7475)\n",
+                    "  --no-gui             Disable the web GUI\n",
+                    "  --graphs-dir <path>  Add an extra graph-root directory for this\n",
+                    "                       session (may be repeated; not persisted).\n",
+                    "                       Use :add-location in the REPL or the GUI to\n",
+                    "                       persist a root across restarts.\n",
+                    "\n",
+                    "User management:\n",
+                    "  minigdb adduser <name>   Add a new user\n",
+                    "  minigdb passwd <name>    Change a user's password\n",
+                    "  minigdb users            List all users\n",
+                    "\n",
+                    "Protocol v2: newline-delimited JSON over TCP.\n",
+                    "Server sends hello on connect, then client may auth, then queries.\n",
+                    "Request:  {{\"id\":1,\"query\":\"MATCH (n) RETURN n\"}}\n",
+                    "Response: {{\"id\":1,\"rows\":[...],\"elapsed_ms\":0.3}}"
+                ));
                 return Ok(());
             }
             other => {
@@ -713,8 +816,7 @@ fn serve_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let data_root = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("minigdb");
-    let graphs_dir = data_root.join("graphs");
-    std::fs::create_dir_all(&graphs_dir)?;
+    std::fs::create_dir_all(data_root.join("graphs"))?;
 
     let mut config = minigdb::server::auth::ServerConfig::load(&data_root);
     // `--no-auth` overrides whatever is set in server.toml at runtime.
@@ -732,7 +834,7 @@ fn serve_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(minigdb::server::serve(config, graphs_dir, addr, gui_addr))?;
+        .block_on(minigdb::server::serve(config, data_root, session_roots, addr, gui_addr))?;
 
     Ok(())
 }
@@ -902,25 +1004,28 @@ mod tests {
         assert!(!validate_graph_name("../evil")); // path traversal
     }
 
-    // ── list_graph_names ────────────────────────────────────────────────────
+    // ── list_graph_names_multi ──────────────────────────────────────────────
 
     #[test]
     fn list_graph_names_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let names = list_graph_names(dir.path());
+        let names = list_graph_names_multi(&[dir.path().to_path_buf()]);
         assert!(names.is_empty());
     }
 
     #[test]
     fn list_graph_names_lists_subdirs_sorted() {
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir(dir.path().join("zebra")).unwrap();
-        fs::create_dir(dir.path().join("alpha")).unwrap();
-        fs::create_dir(dir.path().join("beta")).unwrap();
-        // A file should not appear in the list.
+        for name in &["zebra", "alpha", "beta"] {
+            let p = dir.path().join(name);
+            fs::create_dir(&p).unwrap();
+            fs::write(p.join("CURRENT"), b"").unwrap();
+        }
+        // A plain file and an empty dir (no CURRENT) should not appear.
         fs::write(dir.path().join("notadir.txt"), b"").unwrap();
+        fs::create_dir(dir.path().join("notgraph")).unwrap();
 
-        let names = list_graph_names(dir.path());
+        let names = list_graph_names_multi(&[dir.path().to_path_buf()]);
         assert_eq!(names, vec!["alpha", "beta", "zebra"]);
     }
 
@@ -928,7 +1033,7 @@ mod tests {
     fn list_graph_names_ignores_files() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("myfile"), b"").unwrap();
-        let names = list_graph_names(dir.path());
+        let names = list_graph_names_multi(&[dir.path().to_path_buf()]);
         assert!(names.is_empty());
     }
 
@@ -945,18 +1050,18 @@ mod tests {
         assert!(validate_graph_name("a_b_c"));
     }
 
-    // ── list_graph_names: system graph filtering ─────────────────────────────
+    // ── list_graph_names_multi: system graph filtering ───────────────────────
 
     #[test]
     fn list_graph_names_filters_system_graphs() {
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir(dir.path().join("default")).unwrap();
-        fs::create_dir(dir.path().join("analytics")).unwrap();
-        // System graph — must be hidden from user-facing listing.
-        fs::create_dir(dir.path().join("_meta")).unwrap();
-        fs::create_dir(dir.path().join("_internal")).unwrap();
+        for name in &["default", "analytics", "_meta", "_internal"] {
+            let p = dir.path().join(name);
+            fs::create_dir(&p).unwrap();
+            fs::write(p.join("CURRENT"), b"").unwrap();
+        }
 
-        let names = list_graph_names(dir.path());
+        let names = list_graph_names_multi(&[dir.path().to_path_buf()]);
         assert_eq!(names, vec!["analytics", "default"]);
         assert!(!names.iter().any(|n| n.starts_with('_')));
     }

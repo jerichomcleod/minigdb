@@ -264,7 +264,19 @@ SHOW INDEXES                     -- list all indexes with entry counts
 DROP INDEX ON :Person(name)      -- remove an index
 ```
 
-After creating the index, a query like `MATCH (n:Person {name: "Alice"})` uses it automatically — no query changes needed. Range predicates like `WHERE n.age > 30` also use the index when one exists for that property.
+After creating the index, queries use it automatically — no query changes needed:
+
+| Predicate form | Index use |
+|----------------|-----------|
+| `{name: "Alice"}` or `WHERE n.name = "Alice"` | Point lookup — O(log n) |
+| `WHERE n.age > 30` (also `<`, `>=`, `<=`, range) | Range scan — O(log n + matches) |
+| `WHERE startsWith(n.sku, "BOOK")` | Prefix scan — O(log n + matches) |
+
+```
+CREATE INDEX ON :Product(sku)
+MATCH (p:Product) WHERE startsWith(p.sku, "BOOK") RETURN p.title
+-- Uses the index: scans only matching entries instead of all :Product nodes
+```
 
 Index definitions are persisted to the snapshot, so they survive restarts. The index data is rebuilt from stored nodes on load.
 

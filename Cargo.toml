@@ -1,6 +1,6 @@
 [package]
 name = "minigdb"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "An embedded property-graph database in Rust with a GQL query language, RocksDB-backed ACID storage, graph algorithms, and Python bindings"
 license = "MPL-2.0"
@@ -38,19 +38,21 @@ log         = "0.4"
 env_logger  = "0.11"
 rocksdb     = { version = "0.22", default-features = false, features = ["snappy", "lz4", "zlib", "bzip2"] }
 csv         = "1.3"
+rayon       = "1"
 rustyline   = { version = "14", optional = true }
 dirs        = { version = "5", optional = true }
 pyo3        = { version = "0.22", features = ["abi3-py39", "extension-module"], optional = true }
 tokio       = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "signal"], optional = true }
 toml        = "0.8"
 sha2        = { version = "0.10", optional = true }
+rand        = { version = "0.8", features = ["std"], optional = true }
 rpassword   = { version = "7", optional = true }
 axum        = { version = "0.7", optional = true }
 
 [features]
 default = ["repl", "server", "gui"]
 repl    = ["rustyline", "dirs", "rpassword"]
-server  = ["dep:tokio", "dep:sha2", "dirs"]
+server  = ["dep:tokio", "dep:sha2", "dep:rand", "dirs"]
 gui     = ["server", "dep:axum"]
 python  = ["pyo3", "dirs"]
 

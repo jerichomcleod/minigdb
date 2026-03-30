@@ -52,11 +52,14 @@ The REPL auto-detects complete statements, so semicolons are optional. Multi-lin
 
 | Command | Effect |
 |---------|--------|
-| `:graphs` | List all graphs, marking the active one |
+| `:graphs` | List all graphs across all registered roots, marking the active one |
 | `:create <name>` | Create a new named graph and switch to it |
 | `:use <name>` | Checkpoint the current graph and switch to an existing one |
 | `:drop <name>` | Permanently delete a named graph |
 | `:checkpoint` | Force a snapshot and truncate the WAL immediately |
+| `:locations` | List registered graph-root directories |
+| `:add-location <path>` | Register an additional graph-root directory (persisted) |
+| `:remove-location <path>` | Remove a registered graph-root directory (persisted) |
 | `:quit` or `:q` | Exit (writes a final checkpoint) |
 | `Ctrl-C` | Cancel the current input line |
 | `Ctrl-D` | Exit |

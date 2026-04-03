@@ -193,8 +193,8 @@ tr:hover td{background:#161b22}
       <div id="hist-nav"></div>
     </div>
     <div id="btns">
-      <button onclick="runQuery()" title="Ctrl+Enter">▶ Run</button>
-      <button onclick="vizQuery()" title="Ctrl+Shift+Enter">⬡ Visualize</button>
+      <button id="btn-run" onclick="runQuery()" title="Ctrl+Enter">▶ Run</button>
+      <button id="btn-viz" onclick="vizQuery()" title="Ctrl+Shift+Enter">⬡ Visualize</button>
       <button id="modeBtn" onclick="toggleMode()" title="Replace: clears view&#10;Add: merges into view">↔ Replace</button>
       <button onclick="exportCSV()" title="Export results as CSV">↓ CSV</button>
     </div>
@@ -243,10 +243,11 @@ tr:hover td{background:#161b22}
       <div class="gtcol">
         <button onclick="openViewsModal()" title="Load or manage saved views">📂 Views</button>
       </div>
-      <!-- Col 3 row 2: Fit + Labels -->
+      <!-- Col 3 row 2: Fit + Labels + Select mode -->
       <div class="gtcol">
         <button onclick="resetView()" title="Fit all nodes in view">⛶</button>
         <button id="lblBtn" onclick="toggleLabels()" title="Show/hide labels">⌗</button>
+        <button id="selBtn" onclick="toggleSelectMode()" title="Toggle box-select mode (drag to select multiple nodes)">⬚</button>
       </div>
       <!-- Col 4 row 2: Filter input -->
       <div class="gtcol">
@@ -262,6 +263,10 @@ tr:hover td{background:#161b22}
     </div>
     <div id="node-info">
       <button id="expand-btn" onclick="expandHop()" title="Load one hop of neighbours for selected nodes" style="display:none;float:right;margin-left:8px;padding:2px 8px;background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;cursor:pointer;font-size:11px">⊕ Expand</button>
+      <span id="expand-filters" style="display:none;float:right;font-size:11px;color:#8b949e">
+        edge <input id="expand-edge-type" placeholder="any" title="Filter expand by edge label (e.g. KNOWS)" style="width:72px;padding:1px 5px;font-size:11px;margin:0 4px 0 2px">
+        node <input id="expand-node-label" placeholder="any" title="Filter expand to node label (e.g. Person)" style="width:72px;padding:1px 5px;font-size:11px;margin:0 4px 0 2px">
+      </span>
     </div>
   </div>
 </div>
@@ -277,6 +282,7 @@ let addMode       = false;
 let layoutRunning = false;
 let layoutInst    = null;
 let labelsVisible = true;
+let selectMode    = false;
 let currentRows   = [];
 let sortCol       = null;
 let sortDir       = 1;   // 1 = asc, -1 = desc
@@ -462,27 +468,42 @@ function updateTxnUI() {
 // ── Query ──────────────────────────────────────────────────────────────────────
 function setStatus(m) { document.getElementById('status').textContent = m; }
 
+function setBusy(busy) {
+  const btns = ['btn-run', 'btn-viz'];
+  btns.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.disabled = busy;
+    el.style.opacity = busy ? '0.5' : '';
+  });
+  if (busy) setStatus('⏳ Running…');
+}
+
 async function runQuery() {
   const q = document.getElementById('gql').value.trim();
   if (!q) return;
   pushHistory(q);
-  setStatus('Running…');
+  setBusy(true);
   const t = Date.now();
-  // Use /api/viz so that node/edge variables in results auto-populate the graph panel.
-  const d = await api('/api/viz', { method: 'POST', body: JSON.stringify({ graph: currentGraph, query: q }) });
-  if (!d) return;
-  if (d.error) { setStatus('Error'); showError(d.error); return; }
-  // Sync transaction state if BEGIN/COMMIT/ROLLBACK was typed directly.
-  const ql = q.toUpperCase().trim();
-  if (ql === 'BEGIN')                            { inTxn = true;  updateTxnUI(); }
-  else if (ql === 'COMMIT' || ql === 'ROLLBACK') { inTxn = false; updateTxnUI(); }
-  setStatus(`${(d.rows || []).length} row(s) · ${Date.now() - t}ms`);
-  currentRows = d.rows || [];
-  sortCol = null; sortDir = 1;
-  renderTable(currentRows);
-  // Auto-render graph if any nodes or edges were resolved from the results.
-  if ((d.nodes || []).length > 0 || (d.edges || []).length > 0) {
-    renderGraph(d);
+  try {
+    // Use /api/viz so that node/edge variables in results auto-populate the graph panel.
+    const d = await api('/api/viz', { method: 'POST', body: JSON.stringify({ graph: currentGraph, query: q }) });
+    if (!d) return;
+    if (d.error) { setStatus('Error'); showError(d.error); return; }
+    // Sync transaction state if BEGIN/COMMIT/ROLLBACK was typed directly.
+    const ql = q.toUpperCase().trim();
+    if (ql === 'BEGIN')                            { inTxn = true;  updateTxnUI(); }
+    else if (ql === 'COMMIT' || ql === 'ROLLBACK') { inTxn = false; updateTxnUI(); }
+    setStatus(`${(d.rows || []).length} row(s) · ${Date.now() - t}ms`);
+    currentRows = d.rows || [];
+    sortCol = null; sortDir = 1;
+    renderTable(currentRows);
+    // Auto-render graph if any nodes or edges were resolved from the results.
+    if ((d.nodes || []).length > 0 || (d.edges || []).length > 0) {
+      renderGraph(d);
+    }
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -490,17 +511,21 @@ async function vizQuery() {
   const q = document.getElementById('gql').value.trim();
   if (!q) return;
   pushHistory(q);
-  setStatus('Visualizing…');
+  setBusy(true);
   const t = Date.now();
-  const d = await api('/api/viz', { method: 'POST', body: JSON.stringify({ graph: currentGraph, query: q }) });
-  if (!d) return;
-  if (d.error) { setStatus('Error'); showError(d.error); return; }
-  const nn = (d.nodes || []).length, ne = (d.edges || []).length;
-  setStatus(`${nn} node${nn !== 1 ? 's' : ''} · ${ne} edge${ne !== 1 ? 's' : ''} · ${Date.now() - t}ms`);
-  currentRows = d.rows || [];
-  sortCol = null; sortDir = 1;
-  renderTable(currentRows);
-  renderGraph(d);
+  try {
+    const d = await api('/api/viz', { method: 'POST', body: JSON.stringify({ graph: currentGraph, query: q }) });
+    if (!d) return;
+    if (d.error) { setStatus('Error'); showError(d.error); return; }
+    const nn = (d.nodes || []).length, ne = (d.edges || []).length;
+    setStatus(`${nn} node${nn !== 1 ? 's' : ''} · ${ne} edge${ne !== 1 ? 's' : ''} · ${Date.now() - t}ms`);
+    currentRows = d.rows || [];
+    sortCol = null; sortDir = 1;
+    renderTable(currentRows);
+    renderGraph(d);
+  } finally {
+    setBusy(false);
+  }
 }
 
 // ── Expand Hop ────────────────────────────────────────────────────────────────
@@ -513,19 +538,22 @@ async function expandHop() {
   const seeds = selected.length > 0 ? selected : cy.nodes();
   if (!seeds.length) { setStatus('No nodes to expand'); return; }
 
-  // Build OR-chain: n.id = "id1" OR n.id = "id2" ...
-  // We use MATCH (n) WHERE n = "ulid" syntax since IDs are ULIDs stored as node IDs.
   const ids = seeds.map(n => n.id());
-  // Build a WHERE OR-chain using id(n) = 'ulid' — same pattern as nodeIdsToQuery().
   const conds = ids.map(id => `id(n) = '${id}'`).join(' OR ');
-  const gql = `MATCH (n)-[r]-(m) WHERE ${conds} RETURN n, r, m`;
 
-  setStatus('Expanding…');
+  // Optional filters from the expand filter inputs.
+  const edgeType  = (document.getElementById('expand-edge-type')?.value  || '').trim();
+  const nodeLabel = (document.getElementById('expand-node-label')?.value || '').trim();
+  const edgePart  = edgeType  ? `[r:${edgeType}]`   : '[r]';
+  const mPart     = nodeLabel ? `m:${nodeLabel}`     : 'm';
+  const finalGql  = `MATCH (n)-${edgePart}-(${mPart}) WHERE ${conds} RETURN n, r, m`;
+
+  setBusy(true);
   const t = Date.now();
   const prevAdd = addMode;
   addMode = true; // always merge into existing view
   try {
-    const d = await api('/api/viz', { method: 'POST', body: JSON.stringify({ graph: currentGraph, query: gql }) });
+    const d = await api('/api/viz', { method: 'POST', body: JSON.stringify({ graph: currentGraph, query: finalGql }) });
     if (!d) return;
     if (d.error) { setStatus('Expand error'); showError(d.error); return; }
     const nn = (d.nodes || []).length, ne = (d.edges || []).length;
@@ -533,6 +561,7 @@ async function expandHop() {
     renderGraph(d);
   } finally {
     addMode = prevAdd;
+    setBusy(false);
   }
 }
 
@@ -675,6 +704,7 @@ function initCy() {
     const info = document.getElementById('node-info');
     info.style.display = 'block';
     document.getElementById('expand-btn').style.display = 'inline-block';
+    document.getElementById('expand-filters').style.display = 'inline';
     const props = Object.entries(d)
       .filter(([k]) => !['id', 'dispLabel', 'labels'].includes(k))
       .map(([k, v]) => `<b style="color:#58a6ff">${esc(k)}</b>: ${esc(String(v))}`)
@@ -682,7 +712,11 @@ function initCy() {
     const pinnedBadge = e.target.hasClass('pinned')
       ? ' <span style="color:#f0883e;font-size:11px">[pinned]</span>' : '';
     info.innerHTML =
-      `<button id="expand-btn" onclick="expandHop()" title="Load one hop of neighbours for selected nodes" style="float:right;margin-left:8px;padding:2px 8px;background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;cursor:pointer;font-size:11px">⊕ Expand</button>` +
+      `<span style="float:right;font-size:11px;color:#8b949e">` +
+      `edge <input id="expand-edge-type" placeholder="any" title="Filter by edge label" style="width:72px;padding:1px 5px;font-size:11px;margin:0 4px 0 2px">` +
+      `node <input id="expand-node-label" placeholder="any" title="Filter to node label" style="width:72px;padding:1px 5px;font-size:11px;margin:0 4px 0 2px">` +
+      `<button onclick="expandHop()" title="Load one hop of neighbours" style="padding:2px 8px;background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;cursor:pointer;font-size:11px">⊕ Expand</button>` +
+      `</span>` +
       `<span style="color:#7ee787">NODE</span> ` +
       `<span style="color:#79c0ff">${esc(d.labels || '(no label)')}</span>${pinnedBadge} ` +
       `<span class="id-link" onclick="highlightElement('${esc(d.id)}')" title="${esc(d.id)}">${esc(d.id.slice(0, 13))}…</span><br>` +
@@ -781,7 +815,7 @@ function renderGraph(data) {
   }
   for (const e of (data.edges || [])) {
     if (cy.getElementById(e.id).length) continue;
-    toAdd.push({ group: 'edges', data: { id: e.id, source: e.source, target: e.target, label: e.label } });
+    toAdd.push({ group: 'edges', data: { id: e.id, source: e.source, target: e.target, label: e.label, ...(e.properties || {}) } });
   }
   if (!toAdd.length) return;
   cy.add(toAdd);
@@ -926,6 +960,18 @@ function toggleLabels() {
 }
 
 // ── Fullscreen ─────────────────────────────────────────────────────────────────
+function toggleSelectMode() {
+  if (!cy) return;
+  selectMode = !selectMode;
+  cy.boxSelectionEnabled(selectMode);
+  cy.userPanningEnabled(!selectMode);
+  cy.userZoomingEnabled(!selectMode);
+  const btn = document.getElementById('selBtn');
+  if (btn) btn.classList.toggle('active', selectMode);
+  document.getElementById('cy').style.cursor = selectMode ? 'crosshair' : '';
+  setStatus(selectMode ? 'Box-select mode — drag to select nodes' : '');
+}
+
 function toggleFullscreen() {
   const el = document.getElementById('graph-wrap');
   if (!document.fullscreenElement) {

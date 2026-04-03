@@ -13,9 +13,8 @@
 //! ```
 //!
 //! - `:ID` — user-assigned identifier used to resolve edge endpoints.
-//!   Stored as the `_csv_id` property on the node (allows edge loads to
-//!   match nodes by `_csv_id` without requiring a separate id_map lookup).
-//!   May be omitted; nodes without `:ID` are inserted with no `_csv_id`.
+//!   Collected into the returned `id_map`; not stored as a node property.
+//!   May be omitted; nodes without `:ID` simply have no entry in `id_map`.
 //! - `:LABEL` — per-row label; overrides `default_label` when non-empty.
 //! - All other non-`:`-prefixed columns → node properties (type-inferred).
 //!
@@ -102,9 +101,9 @@ pub fn infer_value(s: &str) -> Value {
 /// Load nodes from a CSV reader into the graph.
 ///
 /// Opens the given `reader`, parses it as RFC 4180 CSV, and inserts one node
-/// per data row.  The `:ID` column (if present) is stored as the `_csv_id`
-/// property on each node and also collected into the returned `id_map` so that
-/// a subsequent [`load_edges_csv`] call can resolve `:START_ID` / `:END_ID`.
+/// per data row.  The `:ID` column (if present) is collected into the returned
+/// `id_map` so that a subsequent [`load_edges_csv`] call can resolve
+/// `:START_ID` / `:END_ID`.  The `:ID` value is **not** stored as a node property.
 ///
 /// # Arguments
 /// - `reader` — any `Read` source (file, `Cursor<Vec<u8>>`, etc.).
@@ -154,11 +153,6 @@ pub fn load_nodes_csv<R: Read>(
 
         // ── Build the property map ──────────────────────────────────────────
         let mut props = Properties::new();
-
-        // Store :ID as _csv_id so edge loads can scan for it if needed.
-        if let Some(ref cid) = csv_id {
-            props.insert("_csv_id".to_string(), Value::String(cid.clone()));
-        }
 
         for (i, header) in headers.iter().enumerate() {
             // Skip all special (colon-prefixed) columns.
@@ -361,8 +355,8 @@ mod tests {
         assert_eq!(node.labels, vec!["Person"]);
         assert_eq!(node.properties["name"], Value::String("Alice".to_string()));
         assert_eq!(node.properties["age"],  Value::Int(30));
-        // :ID stored as _csv_id
-        assert_eq!(node.properties["_csv_id"], Value::String("1".to_string()));
+        // :ID is NOT stored as a node property — only in id_map
+        assert!(!node.properties.contains_key("_csv_id"));
     }
 
     #[test]
